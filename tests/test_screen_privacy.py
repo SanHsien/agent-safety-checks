@@ -1,6 +1,6 @@
 """tools/screen_privacy.py 與 docs/multimodal-screen-privacy-spec.md 的單元測試。
 
-假金鑰一律用字串拼接產生，避免整串出現在原始碼裡被 verify_inbox 的機密掃描擋下。
+假金鑰一律用字串拼接產生，避免整串出現在原始碼裡被機密掃描（secret scanning）誤報。
 """
 
 import os

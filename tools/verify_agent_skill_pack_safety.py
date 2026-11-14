@@ -14,7 +14,7 @@ verify_agent_skill_pack_safety.py — 第三方 Claude Code / Agent Skill 與 MC
       只對內建的宣告範例做自檢（回 0 或 1），同樣不能當作採納依據。
   不帶 --pack、--config、--self-test 的裸執行什麼都沒檢查，會提示改用 --pack 並回 2。
 
-目錄掃描的偵測類別（細節、來源與抓不到的東西見 docs/claude-code-domain-skill-packs-and-mcp-audit.md）：
+目錄掃描的偵測類別（細節、來源與抓不到的東西見 https://github.com/SanHsien/ai-inbox/blob/main/docs/claude-code-domain-skill-packs-and-mcp-audit.md）：
   BYPASS        免審批／破沙盒旗標與設定值
   REMOTE-EXEC   遠端內容接管線、替換或下載後直接執行
   OBFUSCATED    編碼過、無法靜態判讀的指令
@@ -79,7 +79,7 @@ def _ensure_utf8_stdout() -> None:
 
 # ---------------------------------------------------------------------------
 # 規則表。旗標字串拆開組合，避免本檔自己被關鍵字型的守門 hook 擋下。
-# 每一項的官方來源（或「未查證」）列在 docs/claude-code-domain-skill-packs-and-mcp-audit.md。
+# 每一項的官方來源（或「未查證」）列在 https://github.com/SanHsien/ai-inbox/blob/main/docs/claude-code-domain-skill-packs-and-mcp-audit.md。
 # ---------------------------------------------------------------------------
 
 _D = "--danger" + "ously-"
