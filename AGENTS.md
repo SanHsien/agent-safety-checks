@@ -23,7 +23,7 @@
 - 本機兩個版本都要全過：`py -V:Astral/CPython3.11.15 -m unittest discover -s tests` 與 `python -m unittest discover -s tests`（3.14）。CI 跑 ubuntu-latest 與 windows-latest 的 Python 3.11。
 - 測試與 `git commit` 之間用 `&&` 串接，不用 `;`：測試紅燈就不得提交。
 - 不改寫已提交的歷史（本 repo 保留 ai-inbox 的原始歷史）。
-- GitHub Actions 一律釘 commit SHA，`permissions: contents: read`。
+- GitHub Actions 一律釘 commit SHA，`permissions: contents: read`；唯一例外是 CodeQL 上傳結果需要的 `security-events: write`。
 - 每支工具的 `--help` 在 cp950 下要能輸出 UTF-8、結束碼 0、無副作用（`tests/test_cli_help_encoding.py`）。
 - 若有 `REVIEW.md`，修復其中項目後回註修復 commit 與日期。
 
@@ -33,7 +33,9 @@
 tools/    五支檢查工具（各自獨立，單檔可執行）
 tests/    對應的 unittest；test_cli_help_encoding.py 檢查所有工具的 --help
 docs/     multimodal-screen-privacy-spec.md（screen_privacy.py 的規範，以程式為準）
-.github/workflows/ci.yml
+.github/workflows/ci.yml       測試（ubuntu／windows，Python 3.11）
+.github/workflows/codeql.yml   CodeQL（python、actions）
+.github/dependabot.yml         只追 GitHub Actions；freshness、multi-commit 的 waiver 與理由也寫在這裡
 README.md   用途、工具表、能力邊界
 ROADMAP.md  後續工作與刻意不做的事（單一真相源）
 ```
