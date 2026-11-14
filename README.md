@@ -18,12 +18,12 @@
 
 ## 工具表
 
-結束碼是逐支實跑 `--help` 與各種輸入（通過、命中、錯誤路徑）核對過的結果，不是照抄 docstring。
+結束碼由 `tests/test_cli_exit_codes.py` 的獨立行程測試守住通過、命中、裸執行、缺參數與錯誤路徑；`--help` 另由 `tests/test_cli_help_encoding.py` 檢查。
 
 | 指令 | 用途 | 結束碼 |
 |------|------|--------|
 | `python tools/verify_agent_skill_pack_safety.py --pack <目錄>` | 採納前靜態掃描技能包（可重複 `--pack`；另有 `--strict`、`--json`、`--max-bytes`、`--ack-unscanned`；`--config`／`--self-test` 只檢查自述宣告，不能當採納依據） | 0 通過；1 有 FAIL（`--strict` 時 REVIEW 也算）；2 輸入錯誤或無法掃描（裸執行、目錄不存在或為空、有未掃描檔且未確認） |
-| `python tools/verify_tool_call_firewall.py --verify-calls <json>` / `--analyze-trace <json>` | 驗證工具呼叫的單次審批收據與請求雜湊；分析 Agent trace 的 span 去重耗時與 token | 0 全部通過；1 有呼叫被拒，**或檔案不存在**；2 沒給參數，或 JSON／schema 無效 |
+| `python tools/verify_tool_call_firewall.py --verify-calls <json>` / `--analyze-trace <json>` | 驗證工具呼叫的單次審批收據與請求雜湊；分析 Agent trace 的 span 去重耗時與 token | 0 全部通過；1 有呼叫被拒；2 沒給參數、檔案不存在或無法讀取，或 JSON／schema 無效 |
 | `python tools/verify_cloud_persistence_audit.py --scan-dir <目錄>` / `--scan-run-keys` / `--audit-accounts-json <json>` / `--audit-mcp-config <json>` | 本機竊密木馬特徵檔名、Windows Run keys、雲端 Service Account 異常、MCP 設定寫死的憑證 | 0 所選檢查未命中；1 規則命中；2 輸入或讀取失敗、沒選任何檢查，或所選檢查全被跳過（例如非 Windows 只選 `--scan-run-keys`） |
 | `python tools/audit_oauth_credentials.py [--home DIR] [--dir DIR] [--repo DIR] [--strict] [--json]` | 本機 AI 工具 OAuth 憑證檔放置是否安全（位置、權限／ACL、git 狀態、監聽位址）；只讀 metadata，不輸出 token | 0 通過（只有 WARN／INFO）；1 有 ERROR，或 `--strict` 且有 WARN；2 參數錯誤或 `--home` 目錄不存在 |
 | `python tools/screen_privacy.py --title <標題> [--app <exe>]` / `--ocr-file <txt>` | 截圖前判斷視窗類別（`blocked`／`self`／`nocap`／`ok`）；截圖後判斷 OCR 文字要不要丟圖，並輸出脫敏文字 | 0 執行成功（**判斷結果在 stdout，不在結束碼**：`blocked` 與 `action: drop_image` 也回 0）；2 沒給 `--title`／`--ocr-file`、或讀不到 OCR 檔 |
@@ -70,6 +70,7 @@ python -m unittest discover -s tests
 - 單次使用只在單次執行（單一行程、單一批次檔）內記錄，不跨行程持久化。
 - 只認內建的五種工具名稱與各自的欄位白名單；路徑只做邏輯檢查，不確認實體檔案系統上的符號連結。
 - trace 分析是算術去重，不判斷 span 內容是否可信。
+- 檔案不存在、路徑不是檔案或無法讀取時回 2（無法判斷），不算規則命中。
 
 ### verify_cloud_persistence_audit.py
 - 離線啟發式，不判定感染，也不判定帳號授權是否合法。
@@ -91,7 +92,7 @@ python -m unittest discover -s tests
 
 ## 與 ai-inbox 的關係
 
-這些工具原本在 [SanHsien/ai-inbox](https://github.com/SanHsien/ai-inbox) 內開發，後來用 git-filter-repo 切出獨立 repo，**保留原本的 git 歷史**（commit 訊息與 docstring 裡的 `T-2026…` 編號是 ai-inbox 當時的任務編號）。文件裡指向仍留在 ai-inbox 的檔案，一律是 `https://github.com/SanHsien/ai-inbox/blob/main/...` 絕對網址。
+這些工具原本在 [SanHsien/ai-inbox](https://github.com/SanHsien/ai-inbox) 內開發，後來用 git-filter-repo 切出獨立 repo，**保留原本的 git 歷史**（commit 訊息裡的 `T-2026…` 編號是 ai-inbox 當時的任務編號）。文件裡指向仍留在 ai-inbox 的檔案，一律是 `https://github.com/SanHsien/ai-inbox/blob/main/...` 絕對網址。
 
 後續工作與刻意不做的事見 [ROADMAP.md](ROADMAP.md)；開發規則見 [AGENTS.md](AGENTS.md)。
 

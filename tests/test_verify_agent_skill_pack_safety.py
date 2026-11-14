@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_verify_agent_skill_pack_safety.py — verify_agent_skill_pack_safety.py 單元測試 (T-20261108-04)
+"""tests/test_verify_agent_skill_pack_safety.py — verify_agent_skill_pack_safety.py 單元測試
 
 危險旗標與指令一律拆開組合，避免測試檔本身被關鍵字型的守門 hook 擋下。
 fixture 全部用 tempfile 當場建立，不下載也不執行任何第三方內容。

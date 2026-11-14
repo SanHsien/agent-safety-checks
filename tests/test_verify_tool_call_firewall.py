@@ -24,17 +24,6 @@ from verify_tool_call_firewall import (
 
 
 class TestVerifyToolCallFirewall(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.temp_root = Path(".work-tmp")
-        cls.created_temp_root = not cls.temp_root.exists()
-        cls.temp_root.mkdir(exist_ok=True)
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.created_temp_root:
-            cls.temp_root.rmdir()
-
     def setUp(self) -> None:
         self.fw = ToolCallFirewall(
             allowed_roles=("implementer", "maintainer"),
@@ -86,7 +75,7 @@ class TestVerifyToolCallFirewall(unittest.TestCase):
         from verify_tool_call_firewall import main
         from contextlib import redirect_stdout
         import io
-        with tempfile.TemporaryDirectory(dir=".work-tmp") as tmp, redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
             p = Path(tmp) / "calls.json"
             for data in ({}, [], {"invocations": []}, {"invocations": [None]},
                          {"invocations": [{"call": {}}], "allowed_roots": []},
@@ -316,7 +305,7 @@ class TestVerifyToolCallFirewall(unittest.TestCase):
             "replay": [{"call": wf, "receipt": wr}, {"call": wf, "receipt": dict(wr, receipt_id="w2")}],
             "ads": [{"call": dict(wf, path="src/x:evil"), "receipt": wr}],
         }
-        with tempfile.TemporaryDirectory(dir=".work-tmp") as tmp, redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
             for name, invs in cases.items():
                 p = Path(tmp) / (name + ".json")
                 p.write_text(json.dumps({"invocations": invs}), encoding="utf-8")

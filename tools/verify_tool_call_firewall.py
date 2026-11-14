@@ -343,7 +343,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         p = Path(args.verify_calls)
         if not p.is_file():
             print(f"[ERROR] 找不到檔案：{p}")
-            return 1
+            return 2
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             if not isinstance(data, dict) or not isinstance(data.get("invocations"), list) or not data["invocations"]:
@@ -373,7 +373,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         p = Path(args.analyze_trace)
         if not p.is_file():
             print(f"[ERROR] 找不到檔案：{p}")
-            return 1
+            return 2
         raw_text = p.read_text(encoding="utf-8").strip()
         if raw_text.startswith("["):
             spans = json.loads(raw_text)
@@ -388,7 +388,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """退出碼：0 全部通過；1 拒絕／路徑不存在；2 輸入或 schema 無效。"""
+    """退出碼：0 全部通過；1 拒絕；2 輸入、讀取或 schema 無效。"""
     try:
         return _main(argv)
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:

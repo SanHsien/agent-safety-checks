@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify_agent_skill_pack_safety.py — 第三方 Claude Code / Agent Skill 與 MCP 工具鏈採納前安全與決定性靜態審計器 (T-20261108-04)
+verify_agent_skill_pack_safety.py — 第三方 Claude Code / Agent Skill 與 MCP 工具鏈採納前安全與決定性靜態審計器
 
 這是「靜態啟發式掃描」，不執行、不下載任何技能包內容。通過不代表安全，仍需人工審查。
 
