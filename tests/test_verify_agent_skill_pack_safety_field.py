@@ -167,6 +167,59 @@ class TestDefenseOffCommands(FieldCase):
             with self.subTest(sentence=sentence):
                 self.assert_review_only({"references/install.md": f"# Install\n\n{sentence}\n"}, guard.CAT_DEFENSE)
 
+    def test_defense_off_commands_in_markdown_are_review(self) -> None:
+        # 回報：SKILL.md 寫「Then: xattr -d com.apple.quarantine …」完全沒報。
+        # 指令前面有說明文字（Then:／Run:／先執行），指令不在行首，不能只認行首。
+        prose_cmds = (
+            f"Then: {XATTR} -d {QUARANTINE} /Applications/Acme.app",
+            f"Next run {XATTR} -cr /Applications/Acme.app to clear the flag.",
+            f'Run `{XATTR} -dr {QUARANTINE} "$APP"` after copying.',
+            f"先執行 sudo {XATTR} -c ./acme 再開啟。",
+            "Then: sudo spctl --master-disable",
+            "Run `spctl --global-disable` once.",
+            "Finally: csrutil disable",
+            "Then run Set-MpPreference -DisableRealtimeMonitoring $true",
+            r"Then: Add-MpPreference -ExclusionPath C:\tools\acme",
+            r"Then: Unblock-File -Path .\setup.exe",
+            r"Then: Remove-Item .\setup.exe -Stream Zone.Identifier",
+            r"Then: reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v EnableLUA /t REG_DWORD /d 0 /f",
+            r"Then: Set-ItemProperty -Path HKLM:\SOFTWARE\Policies\System -Name EnableLUA -Value 0",
+            "Then: netsh advfirewall set allprofiles state off",
+            "Then: Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False",
+        )
+        for line in prose_cmds:
+            with self.subTest(line=line):
+                self.assert_review_only({"SKILL.md": f"# acme\n\n{line}\n"}, guard.CAT_DEFENSE)
+
+    def test_defense_off_inside_markdown_fence_after_prefix_is_review(self) -> None:
+        body = f"# acme\n\n```text\nThen: {XATTR} -d {QUARANTINE} /Applications/Acme.app\n```\n"
+        self.assert_review_only({"SKILL.md": body}, guard.CAT_DEFENSE)
+
+    def test_markdown_warning_sentence_is_also_review(self) -> None:
+        # 既有設計：說明文字分不出「叫你做」與「叫你別做」，一律交人工判斷。
+        line = f"Never run {XATTR} -cr on downloaded apps."
+        self.assert_review_only({"SKILL.md": f"# acme\n\n{line}\n"}, guard.CAT_DEFENSE)
+
+    def test_markdown_lookalikes_are_not_flagged(self) -> None:
+        for line in (
+            f"Then: {XATTR} -l /Applications/Acme.app",
+            f"Then: {XATTR} -p {QUARANTINE} /Applications/Acme.app",
+            f"Then: {XATTR} -d com.example.note ./file",
+            "Then: spctl --status",
+            "Then: csrutil status",
+            "Then: Set-MpPreference -DisableRealtimeMonitoring $false",
+            "Then: netsh advfirewall set allprofiles state on",
+        ):
+            with self.subTest(line=line):
+                report = self.scan({"SKILL.md": f"# acme\n\n{line}\n"})
+                self.assertNotIn(guard.CAT_DEFENSE, {f.category for f in report.findings}, line)
+
+    def test_script_verdict_is_unchanged_by_markdown_rule(self) -> None:
+        script = f"#!/bin/sh\n{XATTR} -cr /Applications/Acme.app\n"
+        report = self.scan({"SKILL.md": "# acme\n", "install.sh": script})
+        self.assertEqual([f.category for f in report.fails()], [guard.CAT_DEFENSE])
+        self.assertEqual(self.cli("--pack", self.last_pack), 1)
+
     def test_neutral_prose_about_protection_is_not_flagged(self) -> None:
         for sentence in (
             "The installer is signed, so SmartScreen shows the publisher name.",

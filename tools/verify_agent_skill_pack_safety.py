@@ -963,9 +963,24 @@ def analyze_text(text: str, comment: str = "", code_escapes: bool = False, _dept
 def analyze_mention(text: str) -> list[Hit]:
     """說明文字：同樣的偵測，但一律降成 REVIEW，因為無法分辨是「叫你這樣做」還是「叫你別這樣做」。"""
     out: list[Hit] = []
-    for hit in analyze_text(text):
+    for hit in analyze_text(text) + defense_off_in_prose(text):
         out.append(Hit(REVIEW, hit.category, hit.line, "說明文字提及，需人工判斷是指示還是警告：" + hit.detail))
     return out
+
+
+def defense_off_in_prose(text: str) -> list[Hit]:
+    """說明文字裡的移除防護指令。
+
+    說明文字的指令常接在「Then:」「Run」「先執行」之後，不在行首，所以逐個 token 當作指令開頭再檢查一次
+    （行首那個位置 analyze_text 已經查過）。只用在說明文字與 Markdown 程式碼區塊的 REVIEW 判定，
+    腳本與設定檔的 FAIL 判定不受影響。
+    """
+    hits: list[Hit] = []
+    for pipe in split_pipelines(tokenize(normalize_text(text))):
+        for stage in pipe:
+            for idx in range(1, len(stage)):
+                hits += check_defense_off(stage[idx:])
+    return hits
 
 
 # ---------------------------------------------------------------------------
@@ -1259,6 +1274,15 @@ def scan_markdown(rel: str, text: str) -> list[Finding]:
             comment = "#"
         hits = analyze_text("\n".join(block), comment=comment, code_escapes=comment == "//" or lang in ("py", "python"))
         findings.extend(_to_findings(hits, rel, line_offset=block_start))
+        # 區塊裡指令前面接了說明字樣（Then:／Run）的寫法，只列 REVIEW。
+        extra = defense_off_in_prose("\n".join(block))
+        findings.extend(
+            _to_findings(
+                [Hit(REVIEW, h.category, h.line, "指令前有其他文字，需人工判斷是指示還是警告：" + h.detail) for h in extra],
+                rel,
+                line_offset=block_start,
+            )
+        )
 
     for idx in range(body_start, len(lines)):
         ln = lines[idx]
