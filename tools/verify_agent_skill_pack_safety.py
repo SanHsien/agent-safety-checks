@@ -23,6 +23,11 @@ verify_agent_skill_pack_safety.py — 第三方 Claude Code / Agent Skill 與 MC
   INSTALL-EXEC  安裝時自動執行的腳本（npm lifecycle 等）
   AUTO-HOOK     審批之外自動執行的 hook／技能內嵌指令（列出內容，需人工審查）
   MCP-SERVER    MCP 伺服器啟動指令或遠端位址（列出內容，需人工審查）
+  DEFENSE-OFF   移除或關閉系統防護（macOS 隔離屬性／Gatekeeper／SIP、Windows Defender／UAC／防火牆／
+                下載標記）；說明文字叫使用者在 SmartScreen、Gatekeeper 點「仍要執行」只列 REVIEW
+  AGENT-STEER   寫給 agent 的指示：搶占其他工具、不要再請求授權、去讀遠端網址並照做、
+                指引在執行期才由程式印出；只列 REVIEW，不判 FAIL
+  PERSISTENCE   改寫 shell／PowerShell 啟動檔；只列 REVIEW，不判 FAIL
 
 嚴重度：
   FAIL    在可執行的位置（腳本、設定、程式碼區塊）發現已知危險樣式。
@@ -66,6 +71,9 @@ CAT_CRED = "CRED-ACCESS"
 CAT_INSTALL = "INSTALL-EXEC"
 CAT_HOOK = "AUTO-HOOK"
 CAT_MCP = "MCP-SERVER"
+CAT_DEFENSE = "DEFENSE-OFF"
+CAT_STEER = "AGENT-STEER"
+CAT_PERSIST = "PERSISTENCE"
 
 
 def _ensure_utf8_stdout() -> None:
@@ -92,10 +100,19 @@ FAIL_FLAGS: dict[str, str] = {
     _D + _SKIP: "Claude Code：略過所有權限提示",
     "--allow-" + _D[2:] + _SKIP: "Claude Code：把略過權限模式加進可切換的模式",
     _D + "bypass-approvals-and-sandbox": "Codex：不審批也不用沙盒",
-    "--yo" + "lo": "Codex：上一項的別名",
+    "--yo" + "lo": "Codex：上一項的別名；Gemini CLI 等也用同名旗標自動核准",
     _D + "bypass-hook-trust": "Codex：hook 不需要事先信任就執行",
     "--full-" + "auto": "未查證的自動核准旗標",
 }
+
+# 這些旗標名稱太普通，別的工具也拿來當自己的模式名。跟在斜線指令（/autopilot 之類）後面、
+# 同一道指令裡又沒有任何 agent CLI 時降為 REVIEW；其餘情況照樣 FAIL。
+CONTEXT_FLAGS = {"--yo" + "lo"}
+AGENT_CLIS = {
+    "codex", "gemini", "qwen", "claude", "opencode", "aider", "goose", "amp", "droid", "copilot",
+    "cursor-agent", "hermes", "crush", "cline", "kiro", "agent",
+}
+_SLASH_COMMAND_RE = re.compile(r"^/[A-Za-z][\w:.-]*$")
 
 # 會降低審批強度、但不是完全關掉的旗標。
 REVIEW_FLAGS: dict[str, str] = {
@@ -154,7 +171,8 @@ CRED_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(
             rf"(?:user data|google{_S}chrome|google-chrome|microsoft{_S}edge|microsoft-edge|bravesoftware"
-            rf"|brave-browser|/chromium/|opera software).{{0,200}}?{_S}(?:cookies|login data|web data|local state)\b"
+            rf"|brave-browser|/chromium/|opera software)(?P<gap>.{{0,200}}?)(?P<sep>{_S})"
+            r"(?:cookies|login data|web data|local state)\b"
         ),
         "瀏覽器設定檔內的 Cookie／登入資料庫",
     ),
@@ -474,29 +492,49 @@ def _is_executor_stage(stage: list[Tok]) -> bool:
     return bool(_names(stage[0]) & {"sudo", "doas", "env", "xargs"}) and any(_is_executor(n) for n in every)
 
 
-def _flag_pieces(stage: list[Tok]) -> list[tuple[str, int]]:
+def _flag_pieces(stage: list[Tok]) -> list[tuple[str, int, int]]:
     """把 token 再拆成旗標等級的片段：等號、冒號、逗號、括號、引號都當分隔，並轉小寫。
 
     `==`／`!=` 換成哨兵，讓「比較某個值」不會被當成「設定某個值」。
     """
-    pieces: list[tuple[str, int]] = []
+    pieces: list[tuple[str, int, int]] = []
     for tok in stage:
         value = _COMPARE_RE.sub(" \x00 ", tok.value)
         for piece in _PIECE_SPLIT_RE.split(value):
             piece = piece.rstrip(".!?").lower()
             if piece and piece != "-":  # 單獨的 "-" 是 YAML 清單符號，不能擋在旗標和值中間
-                pieces.append((piece, tok.line))
+                pieces.append((piece, tok.line, id(tok)))
     return pieces
 
 
-def check_bypass_flags(words: list[Tok]) -> list[Hit]:
-    """words 是整段文字去掉運算子後的 token。不分行比對，多行寫成的 argv 陣列才配得起來。"""
+def _slash_command_tokens(pipelines: list[list[list[Tok]]]) -> set[int]:
+    """斜線指令（/name …）那一道指令裡的 token。同一道指令只要出現任何 agent CLI 名稱就不算。"""
+    out: set[int] = set()
+    for pipe in pipelines:
+        for stage in pipe:
+            head = stage[0]
+            if head.quoted or head.value != head.raw or not _SLASH_COMMAND_RE.match(head.value):
+                continue
+            if _all_names(stage) & AGENT_CLIS:
+                continue
+            out.update(id(tok) for tok in stage)
+    return out
+
+
+def check_bypass_flags(words: list[Tok], slash_tokens: Iterable[int] = ()) -> list[Hit]:
+    """words 是整段文字去掉運算子後的 token。不分行比對，多行寫成的 argv 陣列才配得起來。
+
+    slash_tokens 是 _slash_command_tokens() 的結果，只影響 CONTEXT_FLAGS 裡的旗標。
+    """
     hits: list[Hit] = []
     pieces = _flag_pieces(words)
     paired: set[int] = set()
-    for idx, (piece, line) in enumerate(pieces):
+    slash = set(slash_tokens)
+    for idx, (piece, line, tok_id) in enumerate(pieces):
         nxt = pieces[idx + 1][0] if idx + 1 < len(pieces) else ""
-        if piece in FAIL_FLAGS:
+        if piece in CONTEXT_FLAGS and tok_id in slash:
+            hits.append(Hit(REVIEW, CAT_BYPASS, line, f"{piece}（跟在斜線指令後面，可能是該指令自己的模式名稱，不是 agent CLI 的旗標；需人工確認）"))
+        elif piece in FAIL_FLAGS:
             hits.append(Hit(FAIL, CAT_BYPASS, line, f"{piece}（{FAIL_FLAGS[piece]}）"))
         elif piece in REVIEW_FLAGS:
             hits.append(Hit(REVIEW, CAT_BYPASS, line, f"{piece}（{REVIEW_FLAGS[piece]}）"))
@@ -512,6 +550,33 @@ def check_bypass_flags(words: list[Tok]) -> list[Hit]:
     return hits
 
 
+_LOOPBACK_URL_RE = re.compile(
+    r"^(?:https?://)?(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d{1,5})?(?:[/?#][^@\\$`\s]*)?$", re.I
+)
+# 不帶值、也不改變連線對象的旗標。-L（跟隨轉址）、-K（設定檔）、-x（代理）這類一律不在內。
+_LOOPBACK_SAFE_FLAG_RE = re.compile(r"^(?:-[sSfq]+|-q?O-|--silent|--show-error|--fail|--quiet|--no-progress-meter)$")
+
+
+def _is_loopback_only_download(stage: list[Tok]) -> bool:
+    """下載指令的對象是不是只有本機 loopback 位址。
+
+    判斷從嚴：第一個 token 必須就是下載指令本身（前面有環境變數或 sudo 都不算），
+    其餘 token 只能是白名單內的旗標或 loopback 網址；出現任何看不懂的東西就回 False。
+    """
+    if not stage or stage[0].quoted or _NAME_EXT_RE.sub("", stage[0].raw.lower()) not in DOWNLOADERS:
+        return False
+    urls = 0
+    for tok in stage[1:]:
+        if tok.raw.strip("\"'") != tok.value:
+            return False
+        if _LOOPBACK_SAFE_FLAG_RE.match(tok.value):
+            continue
+        if not _LOOPBACK_URL_RE.match(tok.value):
+            return False
+        urls += 1
+    return urls > 0
+
+
 def check_pipeline(pipe: list[list[Tok]]) -> list[Hit]:
     hits: list[Hit] = []
     for idx in range(1, len(pipe)):
@@ -520,7 +585,10 @@ def check_pipeline(pipe: list[list[Tok]]) -> list[Hit]:
             continue
         earlier = pipe[:idx]
         shown = " | ".join(" ".join(t.value for t in s) for s in pipe)[:200]
-        if any(_is_downloader_stage(s) for s in earlier):
+        sources = [s for s in earlier if _is_downloader_stage(s)]
+        if sources and all(_is_loopback_only_download(s) for s in sources):
+            hits.append(Hit(REVIEW, CAT_REMOTE, stage[0].line, f"本機 loopback 位址的回應接管線交給直譯器（不是遠端內容，仍需確認該本機服務可信）：{shown}"))
+        elif sources:
             hits.append(Hit(FAIL, CAT_REMOTE, stage[0].line, f"遠端內容接管線執行：{shown}"))
         elif any(_is_decoder_stage(s) for s in earlier):
             hits.append(Hit(FAIL, CAT_OBFUSCATED, stage[0].line, f"解碼後接管線執行：{shown}"))
@@ -630,8 +698,226 @@ def check_credentials(toks: list[Tok]) -> list[Hit]:
     for pattern, label in CRED_PATTERNS:
         for match in pattern.finditer(text):
             tok = words[max(0, bisect_right(offsets, match.start()) - 1)]
-            hits.append(Hit(FAIL, CAT_CRED, tok.line, f"{label}：{match.group()[-80:].strip()}"))
+            shown = match.group()[-80:].strip()
+            groups = match.groupdict()
+            # 瀏覽器名稱和檔名之間完全沒有斜線、緊貼檔名的分隔也只有空白，就是在講話，不是路徑。
+            if groups.get("gap") is not None and "/" not in groups["gap"] and not re.search(r"[/,+]", groups["sep"]):
+                hits.append(Hit(REVIEW, CAT_CRED, tok.line, f"看起來是說明文字而不是路徑（兩者之間沒有路徑分隔），需人工確認：{label}：{shown}"))
+                continue
+            hits.append(Hit(FAIL, CAT_CRED, tok.line, f"{label}：{shown}"))
     return hits
+
+
+# ---------------------------------------------------------------------------
+# 移除或關閉系統防護
+# ---------------------------------------------------------------------------
+
+_PS_FALSE = {"$false", "false", "0"}
+_ZERO = {"0", "0x0", "0x00000000"}
+_ONE = {"1", "0x1", "0x00000001"}
+_UAC_KEY_RE = re.compile(r"\b(?:enablelua|consentpromptbehavioradmin|promptonsecuredesktop)\b")
+_DEFENDER_KEY_RE = re.compile(r"\bdisable(?:antispyware|antivirus|realtimemonitoring|behaviormonitoring)\b")
+_FIREWALL_OFF_RE = re.compile(r"firewall\b.*\bstate\s+off\b|firewall\s+set\s+opmode\s+(?:mode=)?disable")
+_MOTW_REMOVERS = {"remove-item", "ri", "rm", "del", "erase", "clear-content"}
+_REG_WRITERS = {"reg", "set-itemproperty", "sp", "new-itemproperty"}
+
+
+def _value_after(rest: list[str], keys: tuple[str, ...]) -> str:
+    """`/d 0`、`-Value 0`、`-Value:0` 這類「鍵 值」的值；找不到回空字串。"""
+    for pos, item in enumerate(rest):
+        key, _, inline = item.partition(":")
+        if key in keys:
+            return inline or (rest[pos + 1] if pos + 1 < len(rest) else "")
+    return ""
+
+
+def check_defense_off(stage: list[Tok]) -> list[Hit]:
+    """會讓作業系統不再檢查下載內容、或直接關掉防護的指令。只認動作，查詢與重新開啟不算。"""
+    idx, names = _head(stage)
+    if idx is None:
+        return []
+    rest = [tok.value.lower() for tok in stage[idx + 1 :]]
+    text = _stage_text(stage)
+    why = ""
+    if "xattr" in names:
+        short = [item for item in rest if re.fullmatch(r"-[a-z]+", item)]
+        if any("c" in item for item in short):
+            why = "清除全部延伸屬性，連 macOS 隔離標記一起拿掉"
+        elif any("d" in item for item in short) and "com.apple.quarantine" in text:
+            why = "移除 macOS 隔離屬性，Gatekeeper 不再檢查"
+    elif "spctl" in names:
+        if any(item in ("--master-disable", "--global-disable", "--disable") for item in rest):
+            why = "關閉 macOS Gatekeeper"
+    elif "csrutil" in names:
+        if "disable" in rest:
+            why = "關閉 macOS 系統完整性保護（SIP）"
+    elif names & {"set-mppreference", "add-mppreference"}:
+        for pos, item in enumerate(rest):
+            key, _, inline = item.partition(":")
+            value = inline or (rest[pos + 1] if pos + 1 < len(rest) else "")
+            if key.startswith("-disable") and value not in _PS_FALSE:
+                why = "關閉 Microsoft Defender 的防護項目"
+            elif key.startswith("-exclusion"):
+                why = "新增 Microsoft Defender 排除項目"
+    elif "unblock-file" in names or (names & _MOTW_REMOVERS and "zone.identifier" in text):
+        why = "移除 Windows 的網路下載標記，SmartScreen 不再檢查"
+    elif names & _REG_WRITERS and "query" not in rest[:1]:
+        value = _value_after(rest, ("/d", "-value"))
+        if _UAC_KEY_RE.search(text) and value in _ZERO:
+            why = "關閉或降低 Windows UAC"
+        elif _DEFENDER_KEY_RE.search(text) and value in _ONE:
+            why = "用登錄檔關閉 Microsoft Defender"
+    elif "netsh" in names:
+        if _FIREWALL_OFF_RE.search(text):
+            why = "關閉 Windows 防火牆"
+    elif "set-netfirewallprofile" in names:
+        if _value_after(rest, ("-enabled",)) in _PS_FALSE:
+            why = "關閉 Windows 防火牆"
+    if not why:
+        return []
+    shown = " ".join(t.value for t in stage)[:160]
+    return [Hit(FAIL, CAT_DEFENSE, stage[0].line, f"{why}：{shown}")]
+
+
+# ---------------------------------------------------------------------------
+# clone 後執行其中的安裝程式、改寫 shell 啟動檔（都需要跨指令的狀態，只在最外層做）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Clone:
+    line: int
+    keys: set[str]  # "$變數名" 或目錄名（小寫）
+    entered: bool = False  # 之後有沒有 cd 進去
+
+
+@dataclass
+class _ScriptState:
+    clones: list[_Clone] = field(default_factory=list)
+    profile_vars: set[str] = field(default_factory=set)
+
+
+_GIT_VALUE_FLAGS = {
+    "--depth", "-b", "--branch", "-o", "--origin", "-c", "--config", "--reference", "--separate-git-dir",
+    "--template", "-j", "--jobs", "--shallow-since", "--shallow-exclude", "-u", "--upload-pack", "--filter",
+}
+_VAR_REF_RE = re.compile(r"\$\{?([a-z_]\w*)|%([a-z_]\w*)%")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_INSTALLER_RE = re.compile(r"(?:^|[/\\\s\"'(])(?:install|setup|bootstrap)[\w.-]*\.(?:sh|bash|zsh|ps1|py|bat|cmd|js|mjs)\b")
+_CD_NAMES = {"cd", "pushd", "set-location", "sl", "chdir"}
+_NOT_RUNNING = {
+    "cat", "ls", "dir", "less", "more", "head", "tail", "grep", "rg", "test", "[", "[[", "chmod", "chown", "echo",
+    "printf", "cp", "mv", "rm", "sed", "type", "get-content", "gc", "test-path", "write-host", "write-output", "git",
+}
+
+
+def _clone_keys(stage: list[Tok], idx: int) -> set[str] | None:
+    """git clone 的目的地；不是 clone 回 None。"""
+    rest = stage[idx + 1 :]
+    pos = next((i for i, tok in enumerate(rest) if tok.value.lower() == "clone"), None)
+    if pos is None:
+        return None
+    args: list[Tok] = []
+    skip = False
+    for tok in rest[pos + 1 :]:
+        if skip:
+            skip = False
+        elif tok.value.startswith("-"):
+            skip = tok.value.lower() in _GIT_VALUE_FLAGS
+        else:
+            args.append(tok)
+    if not args:
+        return set()
+    dest = args[1] if len(args) > 1 else args[0]
+    variables = {a or b for a, b in _VAR_REF_RE.findall(dest.raw.lower())}
+    if variables:
+        return {"$" + name for name in variables}
+    base = _basename(dest.raw).rsplit(":", 1)[-1]
+    if len(args) == 1:
+        base = re.sub(r"\.git$", "", base)
+    return {base} if base else set()
+
+
+def _mentions(text: str, key: str) -> bool:
+    if key.startswith("$"):
+        name = re.escape(key[1:])
+        return bool(re.search(rf"\$\{{?{name}\b|%{name}%", text))
+    return bool(re.search(rf"(?:^|[/\\\s\"'(]){re.escape(key)}(?:[/\\\s\"')]|$)", text))
+
+
+def check_clone_then_run(stage: list[Tok], state: _ScriptState) -> list[Hit]:
+    """git clone 之後直接執行 clone 下來的安裝程式，中間沒有 checkout 到 commit。只列 REVIEW。
+
+    分支與標籤（--branch）可以被上游改指向，不算固定；要 checkout／reset／switch 到 commit 雜湊才算。
+    """
+    idx, names = _head(stage)
+    if idx is None:
+        return []
+    text = _stage_text(stage)
+    if "git" in names:
+        values = [tok.value.lower() for tok in stage[idx + 1 :]]
+        keys = _clone_keys(stage, idx)
+        if keys is not None:
+            state.clones.append(_Clone(stage[0].line, keys))
+        elif {"checkout", "reset", "switch"} & set(values) and any(_COMMIT_RE.match(v) for v in values):
+            state.clones.clear()
+        return []
+    if not state.clones:
+        return []
+    if names & _CD_NAMES:
+        for clone in state.clones:
+            if any(_mentions(text, key) for key in clone.keys):
+                clone.entered = True
+        return []
+    if names & _NOT_RUNNING or not _INSTALLER_RE.search(text):
+        return []
+    for clone in state.clones:
+        if clone.entered or any(_mentions(text, key) for key in clone.keys):
+            shown = " ".join(t.value for t in stage)[:160]
+            detail = f"clone 後直接執行其中的安裝程式，沒有固定到 commit（第 {clone.line} 行 clone）；執行的是上游當下的內容，不在本次掃描範圍：{shown}"
+            return [Hit(REVIEW, CAT_REMOTE, stage[0].line, detail)]
+    return []
+
+
+_PROFILE_RE = re.compile(
+    r"(?:^|[/\\\s\"'=])(?:\.bashrc|\.bash_profile|\.bash_login|\.zshrc|\.zshenv|\.zprofile|\.profile|config\.fish"
+    r"|microsoft\.powershell_profile\.ps1|profile\.ps1)(?![\w.])|\$\{?profile\b"
+)
+_REDIRECT_RE = re.compile(r"^\d?>>?(.*)$")
+_FILE_WRITERS = {"tee", "tee-object", "add-content", "ac", "out-file", "set-content"}
+
+
+def check_profile_write(stage: list[Tok], state: _ScriptState) -> list[Hit]:
+    """寫入 shell／PowerShell 啟動檔（之後每開一個 shell 都會載入）。讀取與 source 不算。只列 REVIEW。"""
+
+    def is_profile(raw: str) -> bool:
+        low = raw.lower()
+        return bool(_PROFILE_RE.search(low)) or any(_mentions(low, "$" + name) for name in state.profile_vars)
+
+    # 先記下「值是啟動檔路徑」的變數：RC="$HOME/.zshrc"、$target = $PROFILE.CurrentUserAllHosts
+    for tok in stage:
+        if _ASSIGN_RE.match(tok.value) and is_profile(tok.raw.split("=", 1)[1]):
+            state.profile_vars.add(tok.value.split("=", 1)[0].lower())
+    if len(stage) >= 3 and stage[0].value.startswith("$") and stage[1].value == "=":
+        if any(is_profile(tok.raw) for tok in stage[2:]):
+            state.profile_vars.add(stage[0].value[1:].lower())
+        return []
+
+    idx, names = _head(stage)
+    written = False
+    for pos, tok in enumerate(stage):
+        match = _REDIRECT_RE.match(tok.raw)
+        if match:
+            target = match.group(1) or (stage[pos + 1].raw if pos + 1 < len(stage) else "")
+            written = written or is_profile(target)
+    if idx is not None:
+        rest = stage[idx + 1 :]
+        if names & _FILE_WRITERS or ("sed" in names and any(t.value.startswith("-i") for t in rest)):
+            written = written or any(is_profile(tok.raw) for tok in rest)
+    if not written:
+        return []
+    shown = " ".join(t.value for t in stage)[:160]
+    return [Hit(REVIEW, CAT_PERSIST, stage[0].line, f"改寫 shell／PowerShell 啟動檔，之後每開一個 shell 都會載入：{shown}")]
 
 
 def analyze_text(text: str, comment: str = "", code_escapes: bool = False, _depth: int = 0) -> list[Hit]:
@@ -639,14 +925,19 @@ def analyze_text(text: str, comment: str = "", code_escapes: bool = False, _dept
     toks = tokenize(normalize_text(text), comment=comment, code_escapes=code_escapes)
     hits: list[Hit] = []
     downloaded: dict[str, int] = {}
-    hits += check_bypass_flags([tok for tok in toks if not tok.op])
-    for pipe in split_pipelines(toks):
+    pipelines = split_pipelines(toks)
+    hits += check_bypass_flags([tok for tok in toks if not tok.op], _slash_command_tokens(pipelines))
+    state = _ScriptState()
+    for pipe in pipelines:
         hits += check_pipeline(pipe)
         for stage in pipe:
             hits += check_substitution(stage)
             hits += check_encoded_command(stage)
             hits += check_dynamic_exec(stage)
+            hits += check_defense_off(stage)
             if _depth == 0:
+                hits += check_clone_then_run(stage, state)
+                hits += check_profile_write(stage, state)
                 hits += check_download_then_run(stage, downloaded)
                 if _all_names(stage) & DOWNLOADERS:
                     for name in _downloaded_names(stage):
@@ -675,6 +966,149 @@ def analyze_mention(text: str) -> list[Hit]:
     for hit in analyze_text(text):
         out.append(Hit(REVIEW, hit.category, hit.line, "說明文字提及，需人工判斷是指示還是警告：" + hit.detail))
     return out
+
+
+# ---------------------------------------------------------------------------
+# 寫給 agent（或叫使用者照做）的指示文字。全部只列 REVIEW：
+# 句型比對分不出「叫你這樣做」和「叫你別這樣做」，也認不出換句話說的寫法。
+# ---------------------------------------------------------------------------
+
+_TOOLS = r"(?:tools?|browsers?|skills?|mcp|agents?|search|fetch(?:er)?|plugins?|commands?)"
+_BUILTIN = r"(?:built-?in|native|other|default|stock|alternative)"
+_THIS = r"this (?:skill|tool|plugin|server|agent)"
+_ASK = r"(?:ask(?:ing)?|request(?:ing)?|prompt(?:ing)?|seek(?:ing)?|wait(?:ing)? for|re-?ask(?:ing)?|re-?confirm(?:ing)?|confirm(?:ing)?|paus(?:e|ing) for)"
+_CONSENT = r"(?:permissions?|authori[sz]ation|approval|confirmation|consent|sign-?off)"
+_NO_TURN = r"(?:(?!\b(?:without|unless|until|before)\b|[.;!?]\s| - ).)"  # 語意會反過來的詞與句子邊界都不跨過去
+_ZH_ASK = r"(?:詢問|询问|請求|请求|要求|徵求|征求|等待|等候)"
+_ZH_CONSENT = r"(?:授權|授权|核准|許可|许可|同意|確認|确认|批准|審批|审批)"
+_ZH_BUILTIN = r"(?:內建|内置|内建|其他|其它|原生)"
+_DEFENSES = (
+    r"(?:windows defender|microsoft defender|defender|antivirus|anti-virus|real-?time protection|uac"
+    r"|user account control|gatekeeper|smartscreen|firewall|system integrity protection|tamper protection)"
+)
+
+_LABEL_PREEMPT = "要求 agent 預設用它、優先於或取代其他工具"
+_LABEL_NO_ASK = "要求 agent 不必再向使用者請求授權／核准"
+_LABEL_REMOTE = "叫 agent 讀遠端網址並照上面的指示做（內容隨時可改）"
+_LABEL_RUNTIME = "真正的指引在執行期由已安裝的程式印出，審查目錄看不到"
+_LABEL_COOKIE = "把瀏覽器的 Cookie 複製／注入自動化工作階段的登入做法"
+_LABEL_CLICK = "叫使用者略過或關閉系統防護"
+
+# (類別, 說明, 樣式, 是否只看 agent 會載入的檔案)。比對對象已轉小寫、去掉 Markdown 強調符號。
+INSTRUCTION_RULES: list[tuple[str, str, re.Pattern[str], bool]] = [
+    (CAT_STEER, _LABEL_PREEMPT, re.compile(
+        rf"\b(?:prefer|prioriti[sz]e|favou?r|always use|use|choose|reach for)\b.{{0,80}}?\b(?:over|instead of|rather than)\b"
+        rf".{{0,40}}?\b{_BUILTIN}\b.{{0,40}}?\b{_TOOLS}\b"
+    ), False),
+    (CAT_STEER, _LABEL_PREEMPT, re.compile(
+        rf"\b(?:read|use|invoke|load|trigger|activate|consult)\s+{_THIS}\b.{{0,60}}?\bby default\b"
+        rf"|\bby default,?\s.{{0,40}}?\b(?:read|use|invoke|load|trigger|activate|consult)\s+{_THIS}\b"
+        rf"|\bdefault to (?:using |reading |loading )?{_THIS}\b"
+    ), False),
+    (CAT_STEER, _LABEL_PREEMPT, re.compile(
+        rf"\btakes? (?:priority|precedence) over\b.{{0,30}}?\b(?:other|built-?in|native|all|any)\b.{{0,20}}?\b(?:{_TOOLS}|instructions?)"
+        rf"|\b(?:do not|don't|never|avoid|stop)\s+us(?:e|ing)\b.{{0,40}}?\b(?:built-?in|native|default|stock)\b.{{0,30}}?\b{_TOOLS}\b"
+        rf"|\b(?:replaces?|in place of|supersedes?)\b.{{0,30}}?\b(?:built-?in|native|default)\b.{{0,30}}?\b{_TOOLS}\b"
+    ), False),
+    (CAT_STEER, _LABEL_PREEMPT, re.compile(
+        rf"(?:優先|优先|預設|默认|一律|務必|务必|總是|总是|必須|必须).{{0,20}}?(?:使用|讀|读|呼叫|調用|调用|載入|加载)"
+        rf".{{0,40}}?(?:而不是|而非|不要用|勿用|代替|取代).{{0,20}}?{_ZH_BUILTIN}"
+        rf"|(?:取代|代替|優先於|优先于).{{0,10}}?{_ZH_BUILTIN}.{{0,20}}?(?:工具|瀏覽器|浏览器|技能|搜尋|搜索)"
+    ), False),
+    (CAT_STEER, _LABEL_NO_ASK, re.compile(
+        rf"\b(?:do not|don't|dont|never|no need to|need not|needn't|must not|should not|shouldn't)\b{_NO_TURN}{{0,50}}?"
+        rf"\b{_ASK}\b{_NO_TURN}{{0,60}}?\b{_CONSENT}\b"
+        rf"|\b(?:stop|skip|avoid)\s+(?:asking|requesting|prompting|waiting)\b.{{0,60}}?\b{_CONSENT}\b"
+    ), False),
+    (CAT_STEER, _LABEL_NO_ASK, re.compile(
+        rf"\b(?:constitutes?|counts? as|is treated as|implies|assumes?|assumed|deem(?:s|ed)?)\b.{{0,50}}?"
+        rf"\b(?:authori[sz]ation|permission|approval|consent)\b"
+        r"|\breplaces?\b.{0,40}?\b(?:user|human)\b.{0,20}?\b(?:approval|confirmation|sign-?off)\b"
+    ), False),
+    (CAT_STEER, _LABEL_NO_ASK, re.compile(
+        rf"(?:不要|不用|不必|不需|無需|无需|無須|无须|毋須|別|别|勿)(?:再|另外|額外|额外)?.{{0,12}}?{_ZH_ASK}.{{0,15}}?{_ZH_CONSENT}"
+        rf"|(?:視為|视为|等同|即代表).{{0,12}}?(?:授權|授权|同意|核准|批准)"
+    ), False),
+    (CAT_STEER, _LABEL_REMOTE, re.compile(
+        r"\b(?:read|fetch|open|visit|load|download|go to|browse(?: to)?)\b.{0,60}?https?://\S+.{0,80}?"
+        r"\b(?:follow|execute|carry out|obey|do what|do as)\b"
+        r"|\bfollow\b.{0,40}?\b(?:instructions?|steps?|guide|directions)\b.{0,30}?\b(?:at|in|from|on)\b.{0,15}?https?://"
+        r"|(?:讀|读|閱讀|阅读|打開|打开|開啟|抓取|訪問|访问|前往).{0,30}?https?://\S+.{0,40}?(?:照|按照|依照|遵循|依)"
+        r".{0,12}?(?:做|執行|执行|指示|步驟|步骤|操作|說明|说明)"
+    ), False),
+    (CAT_STEER, _LABEL_RUNTIME, re.compile(
+        r"\b(?:run|execute|invoke|call)\b.{0,80}?\b(?:to|and|then)\b.{0,30}?\b(?:load|get|print|fetch|read|follow|obtain|retrieve|see)\b"
+        r".{0,40}?\b(?:instructions|guidance|skill body|skill content|usage guide|playbook|operating manual)\b"
+        r"|\bfollow\b.{0,20}?\b(?:what|whatever)\b.{0,15}?\b(?:it|the command|the cli|the tool)\b.{0,10}?\b(?:prints?|outputs?|returns?|says)\b"
+        r"|(?:執行|执行|运行|運行).{0,40}?(?:印出|輸出|输出|打印).{0,20}?(?:指引|指示|說明|说明|技能)"
+    ), True),
+    (CAT_CRED, _LABEL_COOKIE, re.compile(
+        r"\b(?:copy|paste|export|grab|extract|inject|import|reuse|transfer|dump)\b.{0,60}?\bcookies?\b.{0,80}?"
+        r"\b(?:browser|devtools|dev tools|chrome|network tab|request headers?|logged-?in session)"
+        r"|\b(?:inject|load|import|add)\b.{0,30}?\bcookies?\b.{0,40}?\b(?:into|to)\b.{0,30}?"
+        r"\b(?:session|context|agent-browser|playwright|puppeteer|automation|headless|browser)\b"
+        r"|(?:複製|复制|貼上|粘贴|注入|匯出|导出|匯入|导入).{0,25}?cookie"
+        r"|cookie.{0,25}?(?:複製|复制|貼|粘贴|注入|匯出|导出|匯入|导入)(?:進|进|到|至|入)"
+    ), False),
+    (CAT_DEFENSE, _LABEL_CLICK, re.compile(
+        r"\bsmartscreen\b.{0,120}?(?:run anyway|more info|仍要執行|仍要执行)|(?:run anyway|仍要執行|仍要执行).{0,120}?\bsmartscreen\b"
+        r"|\b(?:gatekeeper|unidentified developer|privacy & security)\b.{0,120}?(?:open anyway|仍要打開|仍要打开)"
+        r"|(?:open anyway|仍要打開|仍要打开).{0,80}?\b(?:gatekeeper|unidentified developer|privacy & security)\b"
+        rf"|\b(?:disable|disabling|turn off|turning off|switch off|deactivate)\b.{{0,40}}?\b{_DEFENSES}\b"
+        r"|(?:關閉|关闭|停用|關掉|关掉|暫停|暂停|禁用).{0,15}?(?:防毒|杀毒|殺毒|defender|即時保護|实时保护|uac"
+        r"|使用者帳戶控制|用户账户控制|gatekeeper|smartscreen|防火牆|防火墙|系統完整性保護)"
+    ), False),
+]
+_INSTRUCTION_HINT_RE = re.compile(
+    r"instead of|rather than|\bover\b|by default|default to|precedence|priority|built-?in|native|\bask|request|prompt|confirm"
+    r"|wait|authori|permission|approval|consent|https?://|\bfollow|cookie|smartscreen|gatekeeper|anyway|disabl|turn(?:ing)? off"
+    r"|switch off|deactivate|unidentified|instruction|guidance|print|output|playbook|manual|usage guide|[\u4e00-\u9fff]"
+)
+_MD_EMPHASIS_RE = re.compile(r"[*`]+")
+_AGENT_FILE_NAMES = {"skill.md", "agents.md", "claude.md", "gemini.md", "copilot-instructions.md", ".cursorrules"}
+_AGENT_DIRS = {"skills", "commands", "agents", "rules", "prompts", "skill-body"}
+
+
+def is_agent_file(rel: str) -> bool:
+    """agent 會直接載入當指示的檔案：SKILL.md、AGENTS.md 之類，或放在 skills/、commands/ 等目錄下的說明檔。"""
+    parts = [p.lower() for p in rel.replace("\\", "/").split("/")]
+    name = parts[-1]
+    ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+    return name in _AGENT_FILE_NAMES or (ext in MARKDOWN_EXT and bool(set(parts[:-1]) & _AGENT_DIRS))
+
+
+def analyze_instructions(text: str, agent_file: bool = False) -> list[Hit]:
+    """找寫給 agent（或叫使用者照做）的指示句型，一律 REVIEW。
+
+    以段落為單位比對：連續的非空行接成一行，折行的句子才配得起來；空行不跨。
+    """
+    hits: list[Hit] = []
+    lines = normalize_text(text).replace("\r", "").split("\n")
+    idx = 0
+    while idx < len(lines):
+        if not lines[idx].strip():
+            idx += 1
+            continue
+        start = idx
+        offsets: list[int] = []
+        parts: list[str] = []
+        pos = 0
+        while idx < len(lines) and lines[idx].strip():
+            part = re.sub(r"\s+", " ", _MD_EMPHASIS_RE.sub("", lines[idx]).strip()).lower().replace("\u2019", "'")
+            offsets.append(pos)
+            parts.append(part)
+            pos += len(part) + 1
+            idx += 1
+        para = " ".join(parts)
+        if not _INSTRUCTION_HINT_RE.search(para):
+            continue
+        for category, label, pattern, agent_only in INSTRUCTION_RULES:
+            if agent_only and not agent_file:
+                continue
+            for match in pattern.finditer(para):
+                line = start + max(0, bisect_right(offsets, match.start()) - 1) + 1
+                hits.append(Hit(REVIEW, category, line, f"{label}：{match.group()[:160]}"))
+    return hits
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +1181,8 @@ def _comment_style(ext: str) -> str:
 
 
 def scan_script(rel: str, text: str, ext: str) -> list[Finding]:
-    return _to_findings(analyze_text(text, comment=_comment_style(ext), code_escapes=ext in CODE_ESCAPE_EXT), rel)
+    findings = _to_findings(analyze_text(text, comment=_comment_style(ext), code_escapes=ext in CODE_ESCAPE_EXT), rel)
+    return findings + _to_findings(analyze_instructions(text, is_agent_file(rel)), rel)
 
 
 _FENCE_RE = re.compile(r"^[ \t>]*(`{3,}|~{3,})\s*([^\s`]*)")
@@ -848,6 +1283,8 @@ def scan_markdown(rel: str, text: str) -> list[Finding]:
         findings += _to_findings(analyze_mention(ln), rel, line_offset=idx)
     if fence:
         close_block()  # 沒關的圍欄一路算到檔尾
+    # 指示句型不分 frontmatter、內文或程式碼區塊，整份都看（提示詞常放在圍欄裡）。
+    findings += _to_findings(analyze_instructions(text, is_agent_file(rel)), rel)
     return findings
 
 
@@ -899,6 +1336,7 @@ def scan_json_obj(rel: str, obj: Any, filename: str) -> list[Finding]:
                 walk(item, f"{ptr}/{idx}", exec_ctx, ancestors)
         elif isinstance(node, str):
             add(analyze_text(node) if exec_ctx else analyze_mention(node), ptr)
+            add(analyze_instructions(node, is_agent_file(rel)), ptr)
 
     walk(obj, "", False, ())
 

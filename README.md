@@ -56,11 +56,38 @@ python -m unittest discover -s tests
 ## 能力邊界（抓不到什麼）
 
 ### verify_agent_skill_pack_safety.py
+
+2026-11-20 依實際審查五個第三方 repo 的結果補的規則。每一條都是句型或指令樣式比對，下表右欄的寫法都抓不到：
+
+| 類別（嚴重度） | 抓得到 | 抓不到 |
+| --- | --- | --- |
+| `DEFENSE-OFF`（可執行位置 FAIL；說明文字 REVIEW） | `xattr -d com.apple.quarantine`、`xattr -c`／`-cr`；`spctl --master-disable`；`csrutil disable`；`Set-MpPreference -Disable…`、`Add-MpPreference -Exclusion…`；`Unblock-File`、刪除 `Zone.Identifier`；用 `reg`／`Set-ItemProperty` 把 `EnableLUA` 等設 0 或把 Defender 的 `Disable…` 設 1；`netsh … state off`、`Set-NetFirewallProfile -Enabled False`。說明文字叫使用者在 SmartScreen 選「仍要執行」、在 Gatekeeper 選「仍要打開」、關閉防毒／UAC／防火牆 | 其他關閉方式（群組原則、`sc stop`、`launchctl`、第三方防毒自己的指令、Linux 的 SELinux／AppArmor）；旗標或鍵名存在變數裡；圖形介面操作的其他說法；只寫「允許此應用程式」這類沒提到防護名稱的句子 |
+| `AGENT-STEER`：搶占（REVIEW） | 「prefer／always use X over／instead of／rather than 內建或其他工具」「read this skill by default」「takes precedence over other skills」「never use the built-in …」與對應的中文句型，出現在 frontmatter、內文、JSON 字串或程式字串都算 | 換句話說的寫法（例如只寫「所有網頁工作都交給我」）；中英以外的語言；只限制自己用哪些工具的句子（例如 `do not use other tools`）刻意不列 |
+| `AGENT-STEER`：不必請求授權（REVIEW） | 「do not／never／no need to … ask／request／wait for … permission／authorization／approval／confirmation」「constitutes／counts as … authorization」「replaces … user approval」與中文「不要再向使用者請求授權」「視為已授權」 | 否定詞和動詞隔了一個句子以上；用「直接執行」「全自動」這類不提授權的說法；`never proceed without asking` 這種方向相反的句子刻意不列。分級為 REVIEW 而不是 FAIL，因為句型分不出「叫你不要問」與「引述一條不該照做的規則」，而且說明文字在本工具一律是 REVIEW |
+| `AGENT-STEER`：讀遠端網址並照做（REVIEW） | 「read／fetch／open `https://…` and follow …」「follow the instructions at `https://…`」「讀取 `https://…` 並照著做」 | 網址存在變數或另一個檔案；只給網址沒有「照做」字眼；給人看的安裝文件也會命中（無法分辨讀者是人還是 agent） |
+| `AGENT-STEER`：指引在執行期才印出（REVIEW，只看 `SKILL.md`、`AGENTS.md` 與 `skills/`、`commands/`、`agents/`、`rules/`、`prompts/` 下的說明檔） | 「run `<指令>` to load／get／print … instructions／guidance」「follow whatever it prints」「執行 … 依印出的指引」 | 其他位置的檔案；沒有提到 instructions／guidance 等字眼的寫法；印出的內容本身（那是已安裝的程式，不在技能目錄裡） |
+| `CRED-ACCESS`：Cookie 注入式登入說明（REVIEW） | 「copy／export／extract cookies … from browser／DevTools」「inject cookies into … session／context」「把 Cookie 標頭複製進 …」 | 程式直接呼叫 `add_cookies`／`setCookie` 之類的 API；不出現 cookie 字眼的 session token 搬移 |
+| `REMOTE-EXEC`：clone 後執行其中的安裝程式（REVIEW） | 同一份腳本或同一個程式碼區塊裡，`git clone` 之後執行名稱是 `install*`／`setup*`／`bootstrap*` 的腳本，而且路徑含 clone 的目的地（變數或目錄名）或先 `cd` 進去；中間 `git checkout`／`reset`／`switch` 到 commit 雜湊就不列。`--branch <標籤>` 不算固定 | clone 與執行分在兩個檔案；`make install`、`npm install`、`pip install .` 這類不是腳本檔名的安裝；`git pull` 更新後再執行；`gh repo clone`、下載壓縮檔再解開。技能包的 README 教人 clone 它自己再跑安裝程式也會命中，這時要確認安裝腳本在掃描範圍內 |
+| `PERSISTENCE`：改寫 shell 啟動檔（REVIEW） | 用 `>`／`>>`、`tee`、`sed -i`、`Add-Content`、`Out-File`、`Set-Content` 寫入 `.bashrc`、`.zshrc`、`.profile`、`config.fish`、`$PROFILE` 等，含先把路徑存進變數再寫（`RC="$HOME/.zshrc"`） | 程式語言的檔案 API（Python `open(…, "a")`、Node `fs.appendFile`）；其他持久化位置（crontab、LaunchAgents、Windows 排程與 Run keys、systemd）；變數經過兩層以上轉手 |
+
+同一批審查修掉的誤判（都只降為 REVIEW，不是不報）：
+
+| 情況 | 現在的判定 | 仍然 FAIL 的相似寫法 |
+| --- | --- | --- |
+| 別的工具自己的 `--yolo` 模式名，跟在斜線指令後面（`/autopilot target --yolo`） | REVIEW | 同一道指令出現任何 agent CLI 名稱（`codex`、`gemini`、`claude`…）、不是斜線指令開頭、包在 `bash -c '…'` 裡、其他略過權限旗標 |
+| 說明文字同時提到「user data」與「cookies」（`user_data_dir` 參數說明），兩者之間沒有任何路徑分隔 | REVIEW | 中間有斜線或反斜線的路徑、`os.path.join(…, "User Data", …, "Cookies")`、`Path / "User Data" / "Cookies"`、`cd …/User Data/Default && cp Cookies` |
+| 下載指令的對象只有 loopback 位址（`localhost`、`127.x.x.x`、`[::1]`）再接管線給直譯器 | REVIEW | 主機名只是以 `localhost` 開頭、網址帶 `@`、多個網址其中一個不是 loopback、帶 `-L`／`-K`／`-x` 或任何白名單以外的參數、前面有環境變數或 `sudo`、網址是變數 |
+
+刻意維持 FAIL 的情況：遠端內容經 `xargs` 代入 `sh -c '…'` 的指令字串（例如把抓回的網址逐一 `curl -X PURGE`）。它不是下載後整份執行，但遠端內容進了 shell 的程式碼位置，靜態無法證明安全。
+
+其餘邊界：
+
 - 執行期才組出來的內容：變數間接（最多 REVIEW）、字串拼接出的旗標、從檔案或環境變數讀進來的參數。
 - 編碼與混淆：base64、十六進位、壓縮檔、被壓縮混淆的 JavaScript；只有 PowerShell 編碼指令與「解碼後接管線」會標 `OBFUSCATED`。
 - 不經管線的遠端執行：`npx`／`uvx`／`pipx run`、`pip install git+https://…`、`mshta`、`certutil -urlcache`、程式內用 HTTP 函式庫下載再執行。
 - 二進位與壓縮檔（`.zip`、`.dxt`、執行檔、圖片）只列為未掃描；技能包以外的東西（相依套件、執行期下載的程式、遠端 MCP 伺服器行為）不在範圍。
-- 不靠危險旗標的攻擊：提示詞注入、合法指令濫用、規則表沒列的憑證路徑、資料外傳。
+- 不靠危險旗標的攻擊：上表句型以外的提示詞注入、合法指令濫用、規則表沒列的憑證路徑、資料外傳。
+- 已知仍會誤判：`curl <網址> | python3 -m json.tool` 這類只把回應排版的管線照樣 FAIL；測試檔裡斷言「參數不含某旗標」的那一行照樣 FAIL（程式檔裡的字串分不出是斷言還是指令）。
 - 旗標清單會過期；YAML frontmatter 只認區塊式寫法（標準庫沒有 YAML 解析器）。
 - 宣告模式（`--config`、`--self-test`）檢查的是填寫者自述，無法驗證真偽。
 - 細節與來源見 [ai-inbox 的技能包審計文件](https://github.com/SanHsien/ai-inbox/blob/main/docs/claude-code-domain-skill-packs-and-mcp-audit.md)。
