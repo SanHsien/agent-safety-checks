@@ -720,6 +720,14 @@ _DEFENDER_KEY_RE = re.compile(r"\bdisable(?:antispyware|antivirus|realtimemonito
 _FIREWALL_OFF_RE = re.compile(r"firewall\b.*\bstate\s+off\b|firewall\s+set\s+opmode\s+(?:mode=)?disable")
 _MOTW_REMOVERS = {"remove-item", "ri", "rm", "del", "erase", "clear-content"}
 _REG_WRITERS = {"reg", "set-itemproperty", "sp", "new-itemproperty"}
+# Set-MpPreference 的 -Disable… 參數別名（-DRTM 等於 -DisableRealtimeMonitoring）。
+_DEFENDER_ALIASES = {"-drtm", "-dbm", "-dioavp", "-dscrptsc", "-darchsc", "-dips", "-dbaf", "-demsc", "-drdsc", "-dsnf"}
+# check_defense_off 認得的指令名；說明文字逐 token 找指令開頭時，只在這些位置才檢查。
+_DEFENSE_HEADS = frozenset(
+    {"xattr", "spctl", "csrutil", "set-mppreference", "add-mppreference", "unblock-file", "netsh", "set-netfirewallprofile"}
+    | _MOTW_REMOVERS
+    | _REG_WRITERS
+)
 
 
 def _value_after(rest: list[str], keys: tuple[str, ...]) -> str:
@@ -755,7 +763,7 @@ def check_defense_off(stage: list[Tok]) -> list[Hit]:
         for pos, item in enumerate(rest):
             key, _, inline = item.partition(":")
             value = inline or (rest[pos + 1] if pos + 1 < len(rest) else "")
-            if key.startswith("-disable") and value not in _PS_FALSE:
+            if (key.startswith("-disable") or key in _DEFENDER_ALIASES) and value not in _PS_FALSE:
                 why = "關閉 Microsoft Defender 的防護項目"
             elif key.startswith("-exclusion"):
                 why = "新增 Microsoft Defender 排除項目"
@@ -968,18 +976,51 @@ def analyze_mention(text: str) -> list[Hit]:
     return out
 
 
-def defense_off_in_prose(text: str) -> list[Hit]:
+_PROSE_WINDOW = 64  # 說明文字裡一條指令最多看幾個 token；限住長度，整段掃描才是線性時間
+_PROSE_LEAD_RE = re.compile(r"^[*_\[(<~]+")
+_PROSE_TRAIL_RE = re.compile(r"[.,;:!?*_\])>~`'\"。，；：！？）」』]+$")
+_GLUED_HEAD_RE = re.compile(r"[a-z][a-z0-9-]*$")
+_MD_LINK_TARGET_RE = re.compile(r"\]\(.*$")  # 連結文字最後一個字黏著網址：-cr](https://…)
+
+
+def _prose_tok(tok: Tok) -> Tok:
+    """說明文字的 token 清理：去掉粗體／連結的 Markdown 符號（含黏在後面的連結網址）與句尾標點；
+    指令黏在前文後面（「請執行xattr」「Then:xattr」）時取出尾端的指令名。"""
+    value = _PROSE_TRAIL_RE.sub("", _PROSE_LEAD_RE.sub("", _MD_LINK_TARGET_RE.sub("", tok.value)))
+    if value and not _names(Tok(value, value, tok.line)) & _DEFENSE_HEADS:
+        glued = _GLUED_HEAD_RE.search(value.lower())
+        if glued and glued.group(0) in _DEFENSE_HEADS:
+            value = glued.group(0)
+    if value == tok.value:
+        return tok
+    return Tok(value, value, tok.line)
+
+
+def defense_off_in_prose(text: str, include_head: bool = False, _depth: int = 0) -> list[Hit]:
     """說明文字裡的移除防護指令。
 
-    說明文字的指令常接在「Then:」「Run」「先執行」之後，不在行首，所以逐個 token 當作指令開頭再檢查一次
-    （行首那個位置 analyze_text 已經查過）。只用在說明文字與 Markdown 程式碼區塊的 REVIEW 判定，
-    腳本與設定檔的 FAIL 判定不受影響。
+    說明文字的指令常接在「Then:」「Run」「先執行」之後，不在行首，所以逐個 token 當作指令開頭再檢查一次。
+    行首那個位置 analyze_text 已經查過，查到的就不重複列（include_head=True 時連行首也查，給跨行段落用）。
+    撇號（Don't）會被當成引號吞掉後面整行，所以引號裡的內容也往內再查。
+    只檢查指令名認得的位置、每次最多看 _PROSE_WINDOW 個 token，長行也是線性時間。
+    只用在說明文字與 Markdown 程式碼區塊的 REVIEW 判定，腳本與設定檔的 FAIL 判定不受影響。
     """
     hits: list[Hit] = []
     for pipe in split_pipelines(tokenize(normalize_text(text))):
         for stage in pipe:
-            for idx in range(1, len(stage)):
-                hits += check_defense_off(stage[idx:])
+            covered = -1
+            if not include_head and check_defense_off(stage):
+                covered = _head(stage)[0]
+            clean = [_prose_tok(tok) for tok in stage]
+            for idx, tok in enumerate(clean):
+                if idx != covered and _names(tok) & _DEFENSE_HEADS:
+                    hits += check_defense_off(clean[idx : idx + _PROSE_WINDOW])
+            if _depth < MAX_NESTING:
+                for tok in stage:
+                    for inner in tok.quoted:
+                        if re.search(r"\s", inner):
+                            for hit in defense_off_in_prose(inner, include_head, _depth + 1):
+                                hits.append(Hit(hit.severity, hit.category, tok.line + hit.line - 1, hit.detail))
     return hits
 
 
@@ -1284,6 +1325,20 @@ def scan_markdown(rel: str, text: str) -> list[Finding]:
             )
         )
 
+    # 段落（連續的非空白說明文字行）：Markdown 會在指令中間換行，單行看不到完整指令。
+    para: list[str] = []
+    para_start = 0
+    para_has_defense = False
+
+    def close_para() -> None:
+        nonlocal para, para_has_defense
+        if len(para) > 1 and not para_has_defense:
+            hits = defense_off_in_prose(" ".join(para), include_head=True)
+            detail = "跨行的說明文字提及，需人工判斷是指示還是警告："
+            findings.extend(_to_findings([Hit(REVIEW, h.category, 1, detail + h.detail) for h in hits], rel, line_offset=para_start))
+        para = []
+        para_has_defense = False
+
     for idx in range(body_start, len(lines)):
         ln = lines[idx]
         match = _FENCE_RE.match(ln)
@@ -1295,16 +1350,26 @@ def scan_markdown(rel: str, text: str) -> list[Finding]:
                 block.append(ln)
             continue
         if match:
+            close_para()
             fence = match.group(1)
             block = []
             block_start = idx + 1
             block_lang = match.group(2)
             continue
+        if not ln.strip():
+            close_para()
+            continue
         for inline in _INLINE_EXEC_RE.finditer(ln):
             where = f"第 {idx + 1} 行"
             findings.append(Finding(REVIEW, CAT_HOOK, rel, where, f"技能載入時自動執行的行內指令：{inline.group(1)[:200]}"))
             findings += _to_findings(analyze_text(inline.group(1), comment="#"), rel, where=where)
-        findings += _to_findings(analyze_mention(ln), rel, line_offset=idx)
+        line_findings = _to_findings(analyze_mention(ln), rel, line_offset=idx)
+        findings += line_findings
+        if not para:
+            para_start = idx
+        para.append(ln)
+        para_has_defense = para_has_defense or any(f.category == CAT_DEFENSE for f in line_findings)
+    close_para()
     if fence:
         close_block()  # 沒關的圍欄一路算到檔尾
     # 指示句型不分 frontmatter、內文或程式碼區塊，整份都看（提示詞常放在圍欄裡）。

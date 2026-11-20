@@ -16,6 +16,7 @@ import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -219,6 +220,73 @@ class TestDefenseOffCommands(FieldCase):
         report = self.scan({"SKILL.md": "# acme\n", "install.sh": script})
         self.assertEqual([f.category for f in report.fails()], [guard.CAT_DEFENSE])
         self.assertEqual(self.cli("--pack", self.last_pack), 1)
+
+    def test_markdown_prose_variants_are_review(self) -> None:
+        # 2026-11-20 覆核找到的繞過：撇號開了引號吞掉後面整行、指令黏在前文（中文不留空白、全形冒號、
+        # 粗體、連結文字）、句尾標點黏在旗標上。
+        for line in (
+            f"Don't panic, then run {XATTR} -cr /Applications/Acme.app",
+            f"It's easy: {XATTR} -d {QUARANTINE} /Applications/Acme.app",
+            f"請執行{XATTR} -cr /Applications/Acme.app",
+            f"先執行：{XATTR} -cr /Applications/Acme.app",
+            f"Then:{XATTR} -cr /Applications/Acme.app",
+            f"Then **{XATTR} -cr /Applications/Acme.app**",
+            f"See [{XATTR} -cr /Applications/Acme.app](https://example.invalid/doc)",
+            f"See [run {XATTR} -cr](https://example.invalid/doc)",
+            "Run `sudo spctl --master-disable`.",
+            "Then run spctl --master-disable.",
+            "Finally: csrutil disable.",
+            "Then: Set-NetFirewallProfile -Profile Domain -Enabled False.",
+        ):
+            with self.subTest(line=line):
+                self.assert_review_only({"SKILL.md": f"# acme\n\n{line}\n"}, guard.CAT_DEFENSE)
+
+    def test_markdown_prose_variant_lookalikes_are_not_flagged(self) -> None:
+        for line in (
+            f"Don't worry, then run {XATTR} -l /Applications/Acme.app",
+            f"請執行{XATTR} -l /Applications/Acme.app",
+            "Then run spctl --status.",
+            "Finally: csrutil status.",
+            "Then **Set-MpPreference -DisableRealtimeMonitoring $false**",
+            "Then: Set-NetFirewallProfile -Profile Domain -Enabled True.",
+        ):
+            with self.subTest(line=line):
+                report = self.scan({"SKILL.md": f"# acme\n\n{line}\n"})
+                self.assertNotIn(guard.CAT_DEFENSE, {f.category for f in report.findings}, line)
+
+    def test_command_wrapped_across_paragraph_lines_is_review(self) -> None:
+        # Markdown 段落常在 80 字左右換行，指令和它的參數被拆到兩行。
+        body = f"# acme\n\nAfter copying the app, run {XATTR} -d\n{QUARANTINE} /Applications/Acme.app to clear it.\n"
+        self.assert_review_only({"SKILL.md": body}, guard.CAT_DEFENSE)
+        body = f"# acme\n\nAfter copying the app, run {XATTR} -d\n\n{QUARANTINE} is an attribute name.\n"
+        report = self.scan({"SKILL.md": body})
+        self.assertNotIn(guard.CAT_DEFENSE, {f.category for f in report.findings})
+
+    def test_defender_parameter_aliases_fail(self) -> None:
+        # Set-MpPreference 的參數別名（Get-Command Set-MpPreference 的 Aliases）。
+        for text in (
+            "Set-MpPreference -DRTM $true",
+            "Set-MpPreference -drtm 1",
+            "Set-MpPreference -dioavp $true",
+            "Set-MpPreference -DBM:$true",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(guard.CAT_DEFENSE, cats(guard.analyze_text(text)), text)
+        self.assertNotIn(guard.CAT_DEFENSE, {h.category for h in guard.analyze_text("Set-MpPreference -DRTM $false")})
+        self.assert_review_only({"SKILL.md": "# acme\n\nThen run Set-MpPreference -DRTM $true\n"}, guard.CAT_DEFENSE)
+
+    def test_fence_command_at_line_start_is_reported_once(self) -> None:
+        body = f"# acme\n\n```sh\nsudo {XATTR} -cr /Applications/Acme.app\n```\n"
+        report = self.scan({"SKILL.md": body})
+        self.assertEqual([(f.severity, f.category) for f in report.findings if f.category == guard.CAT_DEFENSE], [(guard.FAIL, guard.CAT_DEFENSE)])
+
+    def test_prose_scan_of_a_huge_line_finishes(self) -> None:
+        # 逐 token 當指令開頭不能是平方時間：一行幾萬個 token 的檔案（壓縮過的文字、惡意塞爆）會讓掃描器卡死。
+        line = "rm word " * 20000 + f"then {XATTR} -cr /Applications/Acme.app"
+        start = time.perf_counter()
+        hits = guard.analyze_mention(line)
+        self.assertLess(time.perf_counter() - start, 30)
+        self.assertIn(guard.CAT_DEFENSE, {h.category for h in hits})
 
     def test_neutral_prose_about_protection_is_not_flagged(self) -> None:
         for sentence in (
