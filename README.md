@@ -109,7 +109,7 @@ python -m unittest discover -s tests
 - 帳號資料的 `createTime` 要由外部補入（IAM v1 匯出本身沒有），`has_user_managed_keys` 不是遠端金鑰查證。
 - 高權限角色：`roles/owner`／`editor`／`admin`，名稱含 `admin`、`vertex`、`aiplatform`，以及可冒用身分的 `serviceAccountTokenCreator`、`serviceAccountUser`、`workloadIdentityUser`；自訂角色只看名稱，不展開權限。
 - MCP 檢查不是完整 schema 驗證。掃描範圍：根層 `mcpServers`／`servers`、VS Code 的 `mcp.servers`，以及任何深度的 `mcpServers`（例如 Claude Code `~/.claude.json` 的 `projects.<路徑>.mcpServers`）；每個 server 的 `headers`、`env`、`args`、`command`、網址欄位，其他欄位與巢狀物件（`oauth`、`auth`、`cwd`…）也比對已知 token 樣式與敏感鍵名。
-- 佔位符：只豁免完整的 `${VAR}`、`$VAR`、`%VAR%`、`{{VAR}}`、`<VAR>`；但 `<…>`、`{{…}}` 裡若是已知 token 樣式照報。憑證樣式只比對固定前綴（GitHub `ghp_`／`gho_`／`ghs_`／`ghu_`／`ghr_`／`github_pat_`、`sk-`、`sk-ant-`、Google `AIza`、`ya29.`、AWS `AKIA`／`ASIA`、Slack、GitLab、Hugging Face、npm、Stripe live、私鑰區塊）與鍵名、`--api-key 值`／`--token=值` 旗標；拆成多個參數、存在其他檔案、經 shell 變數組出來的值抓不到。
+- 佔位符：只豁免完整的 `${VAR}`、`$VAR`、`%VAR%`、`{{VAR}}`、`<VAR>`；但 `<…>`、`{{…}}` 裡若是已知 token 樣式照報。憑證樣式只比對固定前綴（GitHub `ghp_`／`gho_`／`ghs_`／`ghu_`／`ghr_`／`github_pat_`、`sk-`、`sk-ant-`、Google `AIza`、`ya29.`、AWS `AKIA`／`ASIA`、Slack、GitLab、Hugging Face、npm、Stripe live、私鑰區塊）與鍵名、`--api-key 值`／`--token=值` 旗標、`--header "X-Api-Key: 值"`／`-H`／`--header=名稱:值` 這類名稱帶敏感字樣的標頭；拆成多個參數、存在其他檔案、經 shell 變數組出來的值抓不到。
 - 同一物件有重複鍵（JSON 解析器取前、取後不一致）一律回 2。
 
 ### audit_oauth_credentials.py

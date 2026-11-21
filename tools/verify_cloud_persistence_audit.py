@@ -241,6 +241,28 @@ def _is_sensitive_flag(name: str) -> bool:
             and not any(p in _NON_SECRET_FLAG_PARTS for p in parts))
 
 
+# 命令列裡的 HTTP 標頭（mcp-remote --header "X-Api-Key: 值"、-H、--header=名稱:值）：標頭名稱 + 冒號 + 值。
+_HEADER_ARG_RE = re.compile(r"""(?:^|[\s"'=])([A-Za-z][A-Za-z0-9_-]*)[ \t]*:[ \t]*([^\s"']+)""")
+
+
+def _header_value_reasons(text: str, group: str) -> List[str]:
+    """標頭名稱帶敏感字樣（X-Api-Key、X-Auth-Token、Cookie）、值不是佔位符就報；Authorization 另有規則。"""
+    reasons = []
+    for m in _HEADER_ARG_RE.finditer(text):
+        name, value = m.group(1), m.group(2)
+        if name.lower() == "authorization" or _NON_SECRET_SUFFIX_RE.search(name):
+            continue
+        if not (_SENSITIVE_NAME_RE.search(name) or _SENSITIVE_HEADER_RE.search(name)):
+            continue
+        plain = re.sub(r"(?i)^(?:Bearer|Basic|Token)$", "", value.strip())
+        if not plain:
+            rest = text[m.end():].split()
+            plain = rest[0].strip("\"'") if rest else ""
+        if plain and _is_hardcoded_token(plain):
+            reasons.append(f"{group} 的標頭 {name} 寫死憑證")
+    return reasons
+
+
 def _flag_value_reasons(tokens: List[str], group: str) -> List[str]:
     """命令列 `--api-key 值`、`--token=值`：旗標名稱帶憑證字樣、值不是佔位符就報（不回顯值）。"""
     reasons = []
@@ -337,6 +359,9 @@ def audit_mcp_config_credentials(config_data):
                 fields.append(("command", "command", command))
             reasons.extend(_flag_value_reasons(args, "args"))
             reasons.extend(_flag_value_reasons(command.split(), "command"))
+            for arg in args:
+                reasons.extend(_header_value_reasons(arg, "args"))
+            reasons.extend(_header_value_reasons(command, "command"))
             # 其他欄位（cwd、oauth、auth…）：任何字串都比對已知 token 樣式；巢狀物件的敏感鍵名要是佔位符
             for field, value in cfg.items():
                 if field in ("headers", "env", "args", "command") or field in _URL_FIELDS:

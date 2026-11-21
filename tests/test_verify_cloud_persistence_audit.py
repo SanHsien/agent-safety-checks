@@ -366,6 +366,25 @@ class Review20261121CloudAudit(unittest.TestCase):
         self._good({'command': 'npx', 'args': ['--keyboard-layout', 'us', '--max-tokens', '4096']})
         self._good({'command': 'npx', 'args': ['--api-key', '--verbose']})
 
+    def test_header_argument_with_sensitive_name(self):
+        # ai-inbox REVIEW.md 16.2（T-20261107-05）：mcp-remote --header 是 Claude Desktop 傳標頭最常見的寫法
+        hexkey = '0123456789abcdef' * 2
+        for args in (['mcp-remote', 'https://h/mcp', '--header', 'X-Api-Key:' + hexkey],
+                     ['mcp-remote', 'https://h/mcp', '--header', 'X-Api-Key: ' + hexkey],
+                     ['x', '-H', 'X-Auth-Token:' + hexkey],
+                     ['x', '--header=X-Api-Key:' + hexkey],
+                     ['x', '--header', 'Cookie: session=' + hexkey],
+                     ['server.js', '--api-key=' + hexkey]):
+            with self.subTest(args=args[-1][:14]):
+                self._bad({'command': 'npx', 'args': args})
+        self._bad({'command': 'npx mcp-remote https://h/mcp --header "X-Api-Key: ' + hexkey + '"'})
+        for args in (['mcp-remote', 'https://h/mcp', '--header', 'X-Api-Key:${API_KEY}'],
+                     ['mcp-remote', 'https://h/mcp', '--header', 'X-Api-Key: Bearer ${T}'],
+                     ['x', '--header', 'Accept: application/json'],
+                     ['x', 'C:/work', 'https://h/mcp']):
+            with self.subTest(ok=args[-1][:14]):
+                self._good({'command': 'npx', 'args': args})
+
     def test_other_fields_and_nested_objects_are_scanned(self):
         self._bad({'url': 'https://h/mcp', 'oauth': {'clientId': 'abc', 'clientSecret': 'plainsecretvalue'}})
         self._bad({'url': 'https://h/mcp', 'auth': {'type': 'bearer', 'value': self.GHP}})
