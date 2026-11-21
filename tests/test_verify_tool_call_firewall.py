@@ -313,5 +313,77 @@ class TestVerifyToolCallFirewall(unittest.TestCase):
                     self.assertEqual(main(["--verify-calls", str(p)]), 1)
 
 
+class Review20261121FirewallTest(unittest.TestCase):
+    """2026-11-21 攻擊者角度覆核（REVIEW.md F-1～F-4）找到的繞過，每一項都要維持修正。"""
+
+    def setUp(self) -> None:
+        self.fw = ToolCallFirewall(allowed_roots=("src/",))
+
+    def _write(self, path):
+        call = dict(tool="write_file", role="implementer", path=path, content="x")
+        return self.fw.verify_call(call, issue_approval_receipt("r-" + path, call))
+
+    def test_more_windows_device_names_are_unsafe(self) -> None:
+        # Windows 文件列的保留名稱還有 CONIN$／CONOUT$、COM0／LPT0 與上標數字的 COM¹～³／LPT¹～³
+        for name in ("CONIN$", "conout$", "COM0", "lpt0", "COM¹", "COM²", "COM³",
+                     "LPT¹", "LPT²", "LPT³", "CONIN$.txt"):
+            with self.subTest(name=name):
+                self.assertEqual(self._write("src/" + name)[1], "UNSAFE_PATH")
+
+    def test_unicode_lookalikes_of_separators_dots_and_colon_are_unsafe(self) -> None:
+        # Windows ANSI API 的 best-fit 對應會把這些字元轉成 / \ . :（WorstFit）；執行端若走 ANSI 就會越界
+        for path in ("src/．．/．．/x", "src/a∕..∕x", "src/a⁄b",
+                     "src/¥..¥x", "src/₩x", "src/a＼b", "src/a／b",
+                     "src/a：b", "src/a‥b", "src/․env", "src/a﹨b"):
+            with self.subTest(path=path):
+                self.assertEqual(self._write(path)[1], "UNSAFE_PATH")
+        # 一般非 ASCII 檔名不受影響
+        self.assertEqual(self._write("src/中文檔名.txt")[1], "ALLOWED")
+
+    def test_control_wildcard_and_unencodable_characters_are_unsafe(self) -> None:
+        for path in ("src/a\x00b", "src/a\tb", "src/a\x1bb", "src/x*", "src/x?", "src/a<b", "src/a>b",
+                     'src/a"b', "src/a|b"):
+            with self.subTest(path=repr(path)):
+                ok, code, _ = self._write(path)
+                self.assertFalse(ok)
+                self.assertEqual(code, "UNSAFE_PATH")
+        read = dict(tool="read_file", role="implementer", path="src/\udcff")
+        self.assertEqual(self.fw.verify_call(read)[1], "UNSAFE_PATH")
+
+    def test_cli_rejects_duplicate_json_keys_with_exit_2(self) -> None:
+        # 第一個值與最後一個值不同時，取第一個值的執行端會寫到審批沒看到的路徑
+        from verify_tool_call_firewall import main
+        from contextlib import redirect_stdout
+        import io
+        call = dict(tool="write_file", role="implementer", path="src/a.py", content="x")
+        receipt = json.dumps(issue_approval_receipt("dup", call))
+        docs = [
+            '{"invocations":[{"call":{"tool":"write_file","role":"implementer","path":"../../evil",'
+            '"path":"src/a.py","content":"x"},"receipt":' + receipt + '}],"allowed_roots":["src/"]}',
+            '{"invocations":[{"call":{"tool":"read_file","role":"implementer","path":"src/a"}}],'
+            '"allowed_roots":["/"],"allowed_roots":["src/"]}',
+            '{"invocations":[],"invocations":[{"call":{"tool":"read_file","role":"implementer","path":"src/a"}}],'
+            '"allowed_roots":["src/"]}',
+        ]
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
+            (Path(tmp) / "src").mkdir()
+            p = Path(tmp) / "dup.json"
+            for doc in docs:
+                with self.subTest(doc=doc[:60]):
+                    p.write_text(doc, encoding="utf-8")
+                    with patch.object(Path, "cwd", return_value=Path(tmp)):
+                        self.assertEqual(main(["--verify-calls", str(p)]), 2)
+
+    def test_deeply_nested_json_is_input_error_not_a_crash(self) -> None:
+        from verify_tool_call_firewall import main
+        from contextlib import redirect_stdout
+        import io
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
+            p = Path(tmp) / "deep.json"
+            p.write_text("[" * 200000 + "]" * 200000, encoding="utf-8")
+            self.assertEqual(main(["--verify-calls", str(p)]), 2)
+            self.assertEqual(main(["--analyze-trace", str(p)]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

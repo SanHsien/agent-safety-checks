@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import sys
+import unicodedata
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -49,14 +50,37 @@ TOOL_ALLOWED_FIELDS = {
 # 這些欄位若出現必須是字串
 _STRING_FIELDS = frozenset({"old_string", "new_string", "command"})
 
+_DEVICE_SUFFIXES = [str(i) for i in range(10)] + ["¹", "²", "³"]
 _RESERVED_DEVICE_NAMES = frozenset(
-    {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+    {"con", "prn", "aux", "nul", "conin$", "conout$"}
+    | {f"com{s}" for s in _DEVICE_SUFFIXES} | {f"lpt{s}" for s in _DEVICE_SUFFIXES}
 )
+# Windows 檔名不允許的字元（萬用字元、重新導向符號）；控制字元另外以 Unicode 類別判斷。
+_WINDOWS_INVALID_CHARS = frozenset('<>"|?*')
+# Windows ANSI API 的 best-fit 對應會把這些字元轉成 / \ . : （WorstFit）；NFKC 對不到的列在這裡。
+_BEST_FIT_SEPARATORS = frozenset("¥₩∕⁄⧵⧸⧹﹨＼／")
+
+
+def _has_lookalike_or_control_char(raw_path: str) -> bool:
+    """控制字元、代理字元、Windows 不允許的字元，或看起來像路徑分隔、點、冒號的非 ASCII 字元。"""
+    for ch in raw_path:
+        if ch in _WINDOWS_INVALID_CHARS:
+            return True
+        if ord(ch) < 128:
+            if ord(ch) < 32 or ord(ch) == 127:
+                return True
+            continue
+        if unicodedata.category(ch) in ("Cc", "Cs") or ch in _BEST_FIT_SEPARATORS:
+            return True
+        if any(c in "/\\.:" for c in unicodedata.normalize("NFKC", ch)):
+            return True
+    return False
 
 
 def has_unsafe_windows_segment(raw_path: str) -> bool:
-    """含 ':'（NTFS 替代資料串流、磁碟機代號）、結尾 '.'/空白、保留裝置名或 8.3 '~N' 短名的區段一律視為不安全。"""
-    if ":" in raw_path:
+    """含 ':'（NTFS 替代資料串流、磁碟機代號）、結尾 '.'/空白、保留裝置名或 8.3 '~N' 短名的區段一律視為不安全；
+    控制字元、萬用字元與看起來像 / \\ . : 的 Unicode 字元也一律不安全。"""
+    if ":" in raw_path or _has_lookalike_or_control_char(raw_path):
         return True
     for seg in raw_path.replace("\\", "/").split("/"):
         if not seg or seg == ".":
@@ -326,6 +350,20 @@ def analyze_trace_spans(spans: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    """同一物件出現重複鍵就拒絕：取第一個值與取最後一個值的解析器會看到不同的呼叫（parser differential）。"""
+    out: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("JSON 物件含重複鍵，無法判斷執行端會採用哪一個值")
+        out[key] = value
+    return out
+
+
+def _load_json(text: str) -> Any:
+    return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+
+
 def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="驗證 Tool Call 單次審批收據與分析 Agent Trace Span 去重指標"
@@ -345,7 +383,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"[ERROR] 找不到檔案：{p}")
             return 2
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = _load_json(p.read_text(encoding="utf-8"))
             if not isinstance(data, dict) or not isinstance(data.get("invocations"), list) or not data["invocations"]:
                 raise ValueError("invocations 必須是非空清單")
             for key in ("allowed_roles", "allowed_roots"):
@@ -376,9 +414,9 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         raw_text = p.read_text(encoding="utf-8").strip()
         if raw_text.startswith("["):
-            spans = json.loads(raw_text)
+            spans = _load_json(raw_text)
         else:
-            spans = [json.loads(line) for line in raw_text.splitlines() if line.strip()]
+            spans = [_load_json(line) for line in raw_text.splitlines() if line.strip()]
         if not isinstance(spans, list) or not spans or any(not isinstance(s, dict) or not {"span_id", "start_ms", "end_ms", "total_tokens"} <= s.keys() for s in spans):
             raise ValueError("trace 必須是非空且具必要欄位的 span 清單")
         report = analyze_trace_spans(spans)
@@ -391,6 +429,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """退出碼：0 全部通過；1 拒絕；2 輸入、讀取或 schema 無效。"""
     try:
         return _main(argv)
+    except RecursionError:
+        print("[ERROR] 無法判斷輸入：JSON 巢狀層數過深")
+        return 2
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
         print(f"[ERROR] 無法判斷輸入：{exc}")
         return 2
