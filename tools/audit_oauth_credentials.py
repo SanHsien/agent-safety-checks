@@ -32,11 +32,13 @@ tools/audit_oauth_credentials.py
     WARN   listen-unknown-host  bind／listen 是非 IP 的主機名稱（非 localhost），無法判斷是否對外
     WARN   listen-port-only  bind／listen 只有連接埠、沒指定主機
     WARN   git-tracked-credential  --repo 內追蹤了名稱像憑證檔的檔案，但沒找到明文欄位
-    INFO   git-unknown / skipped-large / acl-unreadable  無法判斷或略過的原因
+    WARN   skipped-large / unreadable  名稱像憑證檔卻讀不到內容（過大、被鎖、沒權限）；權限／ACL／git 照查
+    INFO   git-unknown / skipped-large / unreadable / acl-unreadable  無法判斷或略過的原因（非憑證檔名）
 
 用法：
     python tools/audit_oauth_credentials.py [--home DIR] [--dir DIR ...] [--repo DIR ...] [--json] [--strict]
-結束碼：0 通過；1 有 ERROR（或 --strict 且有 WARN）；2 參數錯誤。
+結束碼：0 通過；1 有 ERROR（或 --strict 且有 WARN）；2 參數錯誤，或 --repo 列不出追蹤檔（不是 git repo、沒有 git）。
+git 呼叫一律加 -c core.fsmonitor=false：被稽核的目錄若在來路不明的 repo 裡，不執行該 repo 設定的 fsmonitor 指令。
 只使用 Python 標準函式庫；ACL 檢查在 Windows 上呼叫內建的 icacls，git 檢查呼叫 git（不在 PATH 就降為 INFO）。
 """
 
@@ -63,10 +65,11 @@ BACKUP_RE = re.compile(r"(?:\.(?:bak|old|orig|save|backup|copy|tmp)(?:\.|$)|~$)"
 # 憑證欄位：正規化（camelCase 轉 snake_case、小寫）後比對；輸出只會用這裡定義的類別名稱。
 _TOKEN_KEY = re.compile(
     r"(?:^|_)(?:(?P<kind>access_token|refresh_token|id_token|auth_token|session_token|bearer_token|oauth_token|"
-    r"api_key|apikey|client_secret|secret_key)|(?P<bare>token))$"
+    r"api_key|apikey|client_secret|secret_key|password|private_key|authorization)|(?P<bare>token))$"
 )
+# 值可以換到下一行，但只限引號字串（JSON 排版器常見）；.env 的空值（KEY=）不能吃掉下一行的設定。
 _KV = re.compile(
-    r"""["']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})["']?[ \t]*[:=][ \t]*"""
+    r"""["']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})["']?[ \t]*[:=](?:[ \t]*\r?\n[ \t]*(?=["'])|[ \t]*)"""
     r"""(?P<val>"(?:[^"\\\n]|\\.)*"|'[^'\n]*'|"[^"\n]+|[^\s,}\]\[{"'#;]+)"""
 )
 _PLACEHOLDER_WORDS = {"null", "none", "true", "false", "nil", "undefined", "redacted", "changeme", "ollama"}
@@ -265,10 +268,15 @@ def _read_icacls(path: Path) -> str | None:
 # ---------------------------------------------------------------- git
 
 
+# 被稽核的目錄可能在來路不明的 repo 裡（例如解壓的專案）：repo 的 .git/config 可設 core.fsmonitor，
+# git 讀索引時會執行它。一律從命令列關掉，命令列設定優先於 repo 設定。
+_GIT_SAFE_CONFIG = ("-c", "core.fsmonitor=false")
+
+
 def _git(args: list[str], cwd: Path) -> tuple[int, str, str] | None:
     env = {**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0"}
     try:
-        proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, timeout=20, env=env)
+        proc = subprocess.run(["git", *_GIT_SAFE_CONFIG, *args], cwd=str(cwd), capture_output=True, timeout=20, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
@@ -301,6 +309,17 @@ def git_state(path: Path) -> str:
 def is_credential_name(name: str) -> bool:
     low = name.lower()
     return any(fnmatch.fnmatchcase(low, g) for g in CREDENTIAL_GLOBS)
+
+
+_ENV_TEMPLATE_RE = re.compile(r"(?:^|[._-])(?:example|sample|template|dist|tmpl|defaults?)(?:[._-]|$)", re.I)
+
+
+def is_env_file_name(name: str) -> bool:
+    """.env、.env.production、prod.env 之類；example／sample／template 範本不算。"""
+    low = name.lower()
+    if not (low == ".env" or low.startswith(".env.") or low.endswith(".env")):
+        return False
+    return not _ENV_TEMPLATE_RE.search(low)
 
 
 def candidate_dirs(home: Path, env: dict[str, str] | None) -> list[Path]:
@@ -350,17 +369,27 @@ def audit_file(
     shown = display_path(path, home)
     findings: list[Finding] = []
     info = {"token_fields": []}
+    cred_named = is_credential_name(path.name)
+    # 名稱像憑證檔卻讀不到內容（過大、被鎖、沒權限）時，內容檢查略過，但權限／ACL／git 仍要查：
+    # 否則把 auth.json 墊到 1 MB 以上，或檔案剛好被鎖住，ACL 外露與被 git 追蹤都會整個跳過。
+    skip_level = "WARN" if cred_named else "INFO"
     try:
         st = path.stat()
-        if st.st_size > MAX_BYTES:
-            return [Finding("INFO", "skipped-large", shown, f"檔案超過 {MAX_BYTES // 1024} KB，略過內容檢查")], info
-        text = decode_text(path.read_bytes())
     except OSError as exc:
-        return [Finding("INFO", "unreadable", shown, f"讀不到檔案（{type(exc).__name__}）")], info
+        return [Finding(skip_level, "unreadable", shown, f"讀不到檔案（{type(exc).__name__}）")], info
+    text = ""
+    if st.st_size > MAX_BYTES:
+        findings.append(Finding(skip_level, "skipped-large", shown, f"檔案超過 {MAX_BYTES // 1024} KB，略過內容檢查"))
+    else:
+        try:
+            text = decode_text(path.read_bytes())
+        except OSError as exc:
+            findings.append(Finding(skip_level, "unreadable", shown, f"讀不到檔案（{type(exc).__name__}）"))
+    if findings and not cred_named:
+        return findings, info
 
     kinds = token_kinds(text)
     info["token_fields"] = kinds
-    cred_named = is_credential_name(path.name)
 
     if kinds:
         findings.append(
@@ -406,7 +435,9 @@ def audit_repo(repo: Path) -> list[Finding]:
         return [Finding("INFO", "git-unknown", shown, "無法列出該 repo 的追蹤檔（不是 git repo，或沒有 git）")]
     out: list[Finding] = []
     for rel in sorted(n for n in res[1].split("\0") if n):
-        if not is_credential_name(Path(rel).name):
+        name = Path(rel).name
+        env_file = is_env_file_name(name)
+        if not is_credential_name(name) and not env_file:
             continue
         target = repo / rel
         kinds: list[str] = []
@@ -415,6 +446,11 @@ def audit_repo(repo: Path) -> list[Finding]:
                 kinds = token_kinds(decode_text(target.read_bytes()))
         except OSError:
             pass
+        if env_file and not is_credential_name(name):
+            # .env 只在真的有明文值時報；沒有值的 .env 太常見（設定開關），只看名稱會淹沒真問題
+            if kinds:
+                out.append(Finding("ERROR", "git-tracked-credential", f"{shown}::{rel}", f"被追蹤的 .env 含明文憑證欄位：{', '.join(kinds)}（只列類別）"))
+            continue
         if kinds:
             out.append(Finding("ERROR", "git-tracked-credential", f"{shown}::{rel}", f"被追蹤且含明文憑證欄位：{', '.join(kinds)}（只列類別）"))
         else:
@@ -485,6 +521,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"錯誤：不是資料夾：{r}", file=sys.stderr)
             return 2
     findings, stats = audit(home, dirs, repos)
+    unlisted = [f for f in findings if f.code == "git-unknown" and "::" not in f.file
+                and any(f.file == r.as_posix() for r in repos)]
+    if unlisted:
+        # 明確指定要查的 repo 卻列不出追蹤檔（不是 git repo、沒有 git、git 拒絕存取）：無法判斷，不能回 0
+        print(f"錯誤：--repo 無法列出追蹤檔（不是 git repo，或沒有 git）：{len(unlisted)} 個", file=sys.stderr)
+        return 2
     errors = sum(f.level == "ERROR" for f in findings)
     warns = sum(f.level == "WARN" for f in findings)
     by_code: dict[str, int] = {}

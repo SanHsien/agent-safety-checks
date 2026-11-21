@@ -707,5 +707,116 @@ class CliTest(unittest.TestCase):
                 proc.stdout.decode("utf-8")  # 不是 UTF-8 會丟 UnicodeDecodeError
 
 
+class Review20261121OauthTest(unittest.TestCase):
+    """2026-11-21 攻擊者角度覆核（REVIEW.md O-1～O-5）找到的問題，每一項都要維持修正。"""
+
+    def setUp(self):
+        self.h = FakeHome()
+        self.addCleanup(self.h.close)
+
+    def git(self, *args, cwd):
+        env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(self.h.root.parent)}
+        subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, env=env)
+
+    def _planted_fsmonitor_repo(self):
+        """repo 的 .git/config 被放了 core.fsmonitor：git 讀索引時會執行它（解壓來路不明的專案就會遇到）。"""
+        repo = self.h.root / "proj"
+        repo.mkdir()
+        self.git("init", "-q", cwd=repo)
+        marker = self.h.root / "FSMONITOR-RAN"
+        if IS_WIN:
+            hook = self.h.root / "hook.bat"
+            hook.write_text('@echo off\r\necho x > "%s"\r\n' % marker, encoding="utf-8")
+        else:
+            hook = self.h.root / "hook.sh"
+            hook.write_text('#!/bin/sh\necho x > "%s"\n' % marker, encoding="utf-8")
+            os.chmod(hook, 0o755)
+        (repo / "auth.json").write_text(CODEX_AUTH, encoding="utf-8")
+        self.git("add", "auth.json", cwd=repo)
+        self.git("config", "core.fsmonitor", str(hook).replace("\\", "/"), cwd=repo)
+        return repo, marker
+
+    @unittest.skipUnless(HAS_GIT, "需要 git")
+    def test_git_checks_never_run_repo_configured_fsmonitor(self):
+        repo, marker = self._planted_fsmonitor_repo()
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.h.root.parent)}):
+            self.assertEqual(a.git_state(repo / "auth.json"), "tracked")
+            self.assertFalse(marker.exists(), "git_state 執行了 repo 設定的 core.fsmonitor")
+            findings = a.audit_repo(repo)
+            self.assertFalse(marker.exists(), "audit_repo 執行了 repo 設定的 core.fsmonitor")
+        self.assertEqual([(f.level, f.code) for f in findings], [("ERROR", "git-tracked-credential")])
+
+    def test_repo_that_cannot_be_listed_exits_2(self):
+        plain = self.h.root / "plain"
+        plain.mkdir()
+        env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(self.h.root.parent)}
+        with mock.patch.dict(os.environ, env):
+            proc = subprocess.run([sys.executable, str(TOOL), "--home", str(self.h.root), "--repo", str(plain)],
+                                  capture_output=True, env=env, timeout=120)
+        self.assertEqual(proc.returncode, 2, proc.stdout.decode("utf-8", "replace"))
+        import contextlib
+        import io
+        with mock.patch.object(a, "_git", return_value=None), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(a.main(["--home", str(self.h.root), "--repo", str(plain)]), 2, "沒有 git 也要回 2")
+
+    def test_oversized_credential_file_still_gets_acl_and_git_checks(self):
+        self.h.write(".codex/auth.json", '{"access_token": "' + "A" * (a.MAX_BYTES + 10) + '"}', 0o644)
+        broad = "auth.json Everyone:(R)\n           NT AUTHORITY\\SYSTEM:(F)\n"
+        findings, _ = run_audit(self.h, is_windows=True, icacls=lambda p: broad, git_check=lambda p: "tracked")
+        self.assertEqual(codes(findings), ["acl-broad", "git-tracked", "skipped-large"])
+        self.assertEqual([f.level for f in findings if f.code == "skipped-large"], ["WARN"])
+        # 名稱不像憑證檔的大檔維持 INFO，也不跑 ACL／git
+        h2 = FakeHome()
+        self.addCleanup(h2.close)
+        h2.write(".claude/history.json", " " * (a.MAX_BYTES + 10))
+        findings, _ = run_audit(h2, is_windows=True, icacls=lambda p: broad, git_check=lambda p: "tracked")
+        self.assertEqual([(f.level, f.code) for f in findings], [("INFO", "skipped-large")])
+
+    def test_unreadable_credential_file_still_gets_acl_and_git_checks(self):
+        p = self.h.write(".codex/auth.json", CODEX_AUTH)
+        broad = "auth.json Everyone:(R)\n"
+        real_read = Path.read_bytes
+
+        def read_bytes(path):
+            if path == p:
+                raise PermissionError("locked")
+            return real_read(path)
+
+        with mock.patch.object(Path, "read_bytes", read_bytes):
+            findings, _ = run_audit(self.h, is_windows=True, icacls=lambda q: broad, git_check=lambda q: "tracked")
+        self.assertEqual(codes(findings), ["acl-broad", "git-tracked", "unreadable"])
+        self.assertEqual([f.level for f in findings if f.code == "unreadable"], ["WARN"])
+
+    def test_more_credential_field_names_and_value_on_next_line(self):
+        val = "abcdef0123456789abcdef"
+        self.assertEqual(a.token_kinds('{"password": "' + val + '"}'), ["password"])
+        self.assertEqual(a.token_kinds('{"private_key": "-----BEGIN PRIVATE KEY-----MIIabc"}'), ["private_key"])
+        self.assertEqual(a.token_kinds('{"headers": {"Authorization": "Bearer ' + val + '"}}'), ["authorization"])
+        self.assertEqual(a.token_kinds('{"env": {"ANTHROPIC_AUTH_TOKEN":\n   "' + val + '"}}'), ["auth_token"])
+        self.assertEqual(a.token_kinds('{"access_token" :\r\n "' + val + '"}'), ["access_token"])
+        # 下一行不是引號字串時不跨行：.env 的空值不能吃掉下一行
+        self.assertEqual(a.token_kinds("API_KEY=\nOTHER_SETTING=" + val + "\n"), [])
+        self.assertEqual(a.token_kinds('{"passwordPolicy": "' + val + '", "password_hint": "' + val + '"}'), [])
+
+    @unittest.skipUnless(HAS_GIT, "需要 git")
+    def test_repo_tracked_env_file_with_plaintext_key_is_error(self):
+        repo = self.h.root / "proj"
+        repo.mkdir()
+        self.git("init", "-q", cwd=repo)
+        (repo / ".env").write_text("OPENAI_API_KEY=abcdef0123456789abcdef\n", encoding="utf-8")
+        (repo / "app").mkdir()
+        (repo / "app" / ".env.production").write_text("API_TOKEN=abcdef0123456789abcdef\n", encoding="utf-8")
+        (repo / ".env.example").write_text("OPENAI_API_KEY=your-openai-api-key-here\n", encoding="utf-8")
+        (repo / ".env.local.template").write_text("API_TOKEN=put-your-token-here-please\n", encoding="utf-8")
+        (repo / ".envrc.sample").write_text("export API_TOKEN=put-your-token-here-please\n", encoding="utf-8")
+        (repo / "empty.env").write_text("DEBUG=1\n", encoding="utf-8")
+        self.git("add", "-A", cwd=repo)
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.h.root.parent)}):
+            findings = a.audit_repo(repo)
+        self.assertEqual(sorted((f.level, f.file.split("::")[1]) for f in findings),
+                         [("ERROR", ".env"), ("ERROR", "app/.env.production")])
+
+
 if __name__ == "__main__":
     unittest.main()
