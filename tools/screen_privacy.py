@@ -7,6 +7,7 @@ tools/screen_privacy.py
 - 第一層：normalize_title / sanitize_title / classify_window（blocked / self / nocap / ok）
 - 第三層：inspect_ocr_text（命中機密即丟）/ redact_text（機密與 PII 脫敏）
 第二層（Windows UIA 無障礙樹探測）需要 COM，平台相依，不在此提供。
+比對前一律去不可見字元並做 NFKC；--ocr-file 依 BOM／NUL 比例解 UTF-8／16／32，解不開就判 drop_image。
 
 本檔的正則常數是規範的唯一正本：文件與程式不一致時以程式為準。
 只使用 Python 標準函式庫。
@@ -126,14 +127,20 @@ TITLE_ADULT = (
 #     "How to read a .pem file - Chrome" 第一段含空白，不會中。
 TITLE_SECRET_FILE_ANYWHERE = (
     r"(?i)(?:(?:^|[\s\\/])\.env(?:\.[\w-]+)?\b|credentials?\.json"
-    r"|secrets?\.(?:json|ya?ml|toml)|\.pem\b|\bid_rsa\b|\.pfx\b|\.p12\b)"
+    r"|secrets?\.(?:json|ya?ml|toml)|\.pem\b|\bid_rsa\b|\.pfx\b|\.p12\b"
+    r"|\bid_(?:dsa|ecdsa|ed25519)(?:_sk)?\b|\.(?:ppk|kdbx)\b"
+    r"|(?:^|[\s\\/])\.(?:envrc|netrc|pgpass|git-credentials|npmrc|pypirc)\b"
+    r"|(?:^|[\s\\/])auth\.json\b|[\\/]\.aws[\\/]credentials\b|^credentials(?=\s[-–—]\s|$))"
 )
 TITLE_SECRET_FILE_AT_END = (
     r"(?i)(?:(?:^|[\s\\/])\.env(?:\.[\w-]+)?|credentials?\.json"
-    r"|secrets?\.(?:json|ya?ml|toml)|\bid_rsa|\.(?:pem|pfx|p12))$"
+    r"|secrets?\.(?:json|ya?ml|toml)|\bid_rsa|\.(?:pem|pfx|p12)"
+    r"|\bid_(?:dsa|ecdsa|ed25519)(?:_sk)?|\.(?:ppk|kdbx)"
+    r"|(?:^|[\s\\/])\.(?:envrc|netrc|pgpass|git-credentials|npmrc|pypirc)"
+    r"|(?:^|[\\/])auth\.json|[\\/]\.aws[\\/]credentials)$"
 )
 
-# 檔名規則「標題任何位置」生效的應用（編輯器、檔案總管）。
+# 檔名規則「標題任何位置」生效的應用（編輯器、檔案總管；終端機另由 TERMINAL_APPS 併入，見 classify_window）。
 FILE_VIEWER_APPS = frozenset({
     "code.exe", "code - insiders.exe", "cursor.exe", "windsurf.exe", "zed.exe",
     "notepad.exe", "notepad++.exe", "sublime_text.exe", "explorer.exe",
@@ -187,7 +194,7 @@ SECRET_ASSIGN_BARE = (
 
 # (標籤, 正則, 遮蔽替代詞)
 SECRET_RULES: Tuple[Tuple[str, str, str], ...] = (
-    ("私鑰區塊", r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----", "[私鑰]"),
+    ("私鑰區塊", r"-----BEGIN[ \t]+(?:[A-Z0-9]+[ \t]+){0,4}PRIVATE[ \t]+KEY-----", "[私鑰]"),
     ("Stripe API Key", r"(?<![A-Za-z0-9_])[sr]k_(?:live|test)_[A-Za-z0-9]{16,}(?![A-Za-z0-9_])", "[Stripe金鑰]"),
     ("Anthropic API Key", r"(?<![A-Za-z0-9_])sk-ant-[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_])", "[Anthropic金鑰]"),
     ("OpenAI API Key", r"(?<![A-Za-z0-9_])sk-(?:proj-|admin-)?[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_])", "[OpenAI金鑰]"),
@@ -242,6 +249,15 @@ ACTION_DROP = "drop_image"
 ACTION_PASS = "pass"
 # 會跟著截圖一起送出的高敏感號碼：OCR 命中就丟棄整張圖，不只遮文字
 DROP_IMAGE_PII = frozenset({"台灣身分證字號", "信用卡號"})
+# 有固定前綴、不會從一般文字接出來的金鑰樣式：OCR 把長金鑰折成兩行時，接回來再比對一次。
+# 泛用規則（Bearer、帳密賦值、連線字串、Discord、Telegram）不接行，避免把相鄰兩行的普通文字接成「機密」。
+WRAP_JOIN_SECRET_LABELS = frozenset({
+    "私鑰區塊", "Stripe API Key", "Anthropic API Key", "OpenAI API Key", "GitHub Token",
+    "GitHub Fine-grained PAT", "AWS Access Key", "Google Cloud Key", "Slack Token", "Supabase Secret",
+    "npm Access Token", "Hugging Face Token", "SendGrid API Key", "GitLab PAT", "Webhook Secret",
+    "JSON Web Token (JWT)",
+})
+_OCR_LINE_WRAP = re.compile(r"(?<=[A-Za-z0-9_\-])[ \t]*\r?\n[ \t]*(?=[A-Za-z0-9_\-])")
 
 
 def _compile_all() -> None:
@@ -271,8 +287,27 @@ def _norm_app(app: Optional[str]) -> str:
     return name
 
 
+def _app_variants(app: Optional[str]) -> frozenset:
+    """執行檔名的比對形式：Linux／macOS 的行程名稱沒有 .exe（keepassxc、KeePassXC.app），一律補成有、無 .exe 兩種。"""
+    name = unicodedata.normalize("NFKC", _norm_app(app))
+    stems = {name}
+    for suffix in (".exe", ".app"):
+        if name.endswith(suffix):
+            stems.add(name[: -len(suffix)])
+    return frozenset(stems | {stem + ".exe" for stem in stems if stem})
+
+
 def _is_file_viewer_app(app: str) -> bool:
     return app in FILE_VIEWER_APPS
+
+
+def _title_views(title: Optional[str]) -> List[str]:
+    """比對用的標題：去不可見字元、NFKC（全形、半形片假名、NBSP、全形空白）、空白收斂、去動態前綴；
+    另加一份去掉組合附加符號的版本（P + U+0301 不能拿來繞過 Password）。兩份任一命中即算。"""
+    t = normalize_title(_WS.sub(" ", unicodedata.normalize("NFKC", _drop_invisible(title))))
+    bare = unicodedata.normalize(
+        "NFC", "".join(ch for ch in unicodedata.normalize("NFKD", t) if unicodedata.category(ch) != "Mn"))
+    return [t] if bare == t else [t, bare]
 
 
 # --------------------------------------------------------------------------
@@ -281,20 +316,24 @@ def _is_file_viewer_app(app: str) -> bool:
 
 def classify_window(app: str, title: str) -> str:
     """回傳 "blocked" | "self" | "nocap" | "ok"，優先序依此排列（先中先贏）。"""
-    app_n = _norm_app(app)
-    t = normalize_title(_drop_invisible(title))  # 零寬字元不能拿來繞過比對
+    apps = _app_variants(app)
+    views = _title_views(title)  # 零寬字元、全形字、NBSP、組合附加符號都不能拿來繞過比對
+    t = views[0]
+    terminal = bool(apps & TERMINAL_APPS)
 
-    if app_n in BLOCKED_APPS or any(rx.search(t) for rx in _TITLE_BLOCKED):
+    if apps & BLOCKED_APPS or any(rx.search(v) for v in views for rx in _TITLE_BLOCKED):
         return "blocked"
-    if _is_file_viewer_app(app_n) and _TITLE_FILE_ANY.search(t):
+    # 終端機標題常是正在跑的指令（nano .env、vim ~/.ssh/id_rsa），和編輯器一樣任何位置出現機密檔名就擋
+    if (terminal or any(_is_file_viewer_app(a) for a in apps)) and any(_TITLE_FILE_ANY.search(v) for v in views):
         return "blocked"
-    first = _SEGMENT_SPLIT.split(t, 1)[0].strip()
-    if first and not _WS_ANY.search(first) and _TITLE_FILE_END.search(first):
-        return "blocked"
+    for v in views:
+        first = _SEGMENT_SPLIT.split(v, 1)[0].strip()
+        if first and not _WS_ANY.search(first) and _TITLE_FILE_END.search(first):
+            return "blocked"
 
-    if app_n in SELF_APPS or (app_n in TERMINAL_APPS and _TITLE_SELF.search(t)):
+    if apps & SELF_APPS or (terminal and _TITLE_SELF.search(t)):
         return "self"
-    if app_n in NOCAP_APPS or _TITLE_NOCAP.search(t):
+    if apps & NOCAP_APPS or _TITLE_NOCAP.search(t):
         return "nocap"
     return "ok"
 
@@ -303,14 +342,34 @@ def classify_window(app: str, title: str) -> str:
 # 第 5 節：OCR 檢查與脫敏
 # --------------------------------------------------------------------------
 
-def redact_secrets(text: str) -> Tuple[str, List[str]]:
-    """依 SECRET_RULES 順序遮蔽機密，回傳（遮蔽後文字, 命中的標籤）。"""
+def prepare_ocr_text(text: Optional[str]) -> str:
+    """比對前的 OCR 文字：去掉零寬、雙向覆寫等不可見字元（保留換行與 tab），再做 NFKC（全形英數、NBSP、全形空白）。"""
+    return unicodedata.normalize("NFKC", _drop_invisible(text or "", keep="\n\r\t"))
+
+
+def _join_wrapped_lines(text: str) -> str:
+    return _OCR_LINE_WRAP.sub("", text)
+
+
+def _redact_with(rules, text: str) -> Tuple[str, List[str]]:
     hits: List[str] = []
-    for label, rx, repl in _SECRETS:
+    for label, rx, repl in rules:
         text, n = rx.subn(repl, text)
         if n:
             hits.append(label)
     return text, hits
+
+
+def redact_secrets(text: str) -> Tuple[str, List[str]]:
+    """依 SECRET_RULES 順序遮蔽機密，回傳（遮蔽後文字, 命中的標籤）。
+    文字先經 prepare_ocr_text；有固定前綴的金鑰若被折成兩行，接回後也算命中（此時回傳接行後的文字）。"""
+    masked, hits = _redact_with(_SECRETS, prepare_ocr_text(text))
+    joined_masked, wrapped = _redact_with(
+        [r for r in _SECRETS if r[0] in WRAP_JOIN_SECRET_LABELS], _join_wrapped_lines(masked))
+    if wrapped:
+        masked = joined_masked
+        hits += [label for label in wrapped if label not in hits]
+    return masked, hits
 
 
 def scan_secrets(text: str) -> List[str]:
@@ -319,7 +378,7 @@ def scan_secrets(text: str) -> List[str]:
 
 
 def keyword_hits(text: str) -> List[str]:
-    lowered = (text or "").lower()
+    lowered = prepare_ocr_text(text).lower()
     return [kw for kw in SENSITIVE_KEYWORDS if kw.lower() in lowered]
 
 
@@ -378,6 +437,7 @@ def _pii_matches(label: str, rx: "re.Pattern[str]", text: str) -> List[str]:
 
 def drop_image_pii_hits(text: str) -> List[str]:
     """命中的高敏感號碼類別（身分證、卡號）。這些號碼會隨截圖一起送出，命中就丟棄整張圖。"""
+    text = prepare_ocr_text(text)
     return [label for label, rx, _ in _PII if label in DROP_IMAGE_PII and _pii_matches(label, rx, text)]
 
 
@@ -414,6 +474,28 @@ def redact_text(text: str) -> str:
 # CLI
 # --------------------------------------------------------------------------
 
+def decode_ocr_bytes(raw: bytes) -> Tuple[str, bool]:
+    """依 BOM 解 UTF-8／UTF-16／UTF-32；沒有 BOM 但一半是 NUL 時當 UTF-16（PowerShell 5 的 > 與 Out-File）。
+    回傳（文字, 是否可靠解碼）。不可靠時文字只供參考，呼叫端必須判為無法判斷。"""
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        codec = "utf-32"
+    elif raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        codec = "utf-16"
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        codec = "utf-8-sig"
+    elif len(raw) >= 4 and raw[1::2].count(0) > len(raw) // 4:
+        codec = "utf-16-le"
+    elif len(raw) >= 4 and raw[0::2].count(0) > len(raw) // 4:
+        codec = "utf-16-be"
+    else:
+        codec = "utf-8"
+    try:
+        text = raw.decode(codec)
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", "replace").replace("\x00", ""), False
+    return text.replace("\x00", ""), True
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="screen_privacy.py",
@@ -440,10 +522,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.ocr_file is not None:
         try:
-            text = Path(args.ocr_file).read_text(encoding="utf-8", errors="replace")
+            text, decoded = decode_ocr_bytes(Path(args.ocr_file).read_bytes())
         except OSError as exc:
             print(f"[!] 讀不到 OCR 檔：{exc}", file=sys.stderr)
             return 2
+        if not decoded:
+            # 編碼認不出來（例如 cp950）：中文關鍵字、機密都可能比對不到，無法判斷就丟圖，也不輸出文字
+            print("sensitive: true")
+            print(f"action: {ACTION_DROP}")
+            print("reasons: OCR 檔不是可辨識的 UTF-8／UTF-16／UTF-32，無法判斷")
+            print("（已丟棄，不輸出文字）")
+            return 0
         sensitive, action = inspect_ocr_text(text)
         print(f"sensitive: {str(sensitive).lower()}")
         print(f"action: {action}")

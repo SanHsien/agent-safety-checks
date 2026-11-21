@@ -1,8 +1,8 @@
 # 多模態 Coding Agent 螢幕截圖與 OCR 視覺隱私安全檢驗規範
 ## Multimodal Screen Privacy & Credential Defense Specification
 
-- **文件版本**：1.1.0
-- **生效日期**：2026-10-25
+- **文件版本**：1.2.0
+- **生效日期**：2026-11-21
 - **維護角色**：系統架構維護者
 - **適用範圍**：所有具備本機螢幕截圖、錄影、視覺感知（Vision/Screen Context）、OCR 文字識別及 Computer-Use 操作能力之 Coding Agent（包含 Antigravity、Claude Code、Codex CLI、Gemini CLI 等多代理協同工具鏈）
 
@@ -120,7 +120,7 @@ def sanitize_title(text: str, limit: int = 160) -> str:
 | **等級 3** | `nocap` | **無截圖**：僅記錄正規化後標題，嚴禁擷取螢幕畫面與 OCR。防止通訊個資與娛樂畫面外洩。 | 通訊軟體（LINE、Slack、Discord、Telegram）、郵件客戶端、遊戲客戶端 |
 | **等級 4** | `ok` | **允許處理**：允許擷取截圖與進行 OCR 分析，但擷取之文本須經第三層過濾脫敏。 | 編輯器（VS Code、Cursor）、一般開發瀏覽器頁面、編譯終端 |
 
-判定順序為 `blocked` → `self` → `nocap` → `ok`（先中先贏）。比對前先去除標題中的不可見字元（零寬、雙向覆寫），避免以此繞過黑名單。`self` 只在代理自己的應用程式，或終端機類應用且標題含 Claude Code／Antigravity／Codex 時成立；`nocap` 的網頁版信箱與通訊軟體名稱，必須是標題中以 ` - ` 分隔的獨立一段（`Slack API reference - Chrome` 不算）。完整名單見程式的 `SELF_APPS`、`TERMINAL_APPS`、`NOCAP_APPS`、`TITLE_NOCAP`。
+判定順序為 `blocked` → `self` → `nocap` → `ok`（先中先贏）。比對前先去除標題中的不可見字元（零寬、雙向覆寫），再做 NFKC 正規化（全形英數、半形片假名、NBSP、全形空白）並把連續空白收成一個；`blocked` 另外拿去掉組合附加符號的版本再比一次（`P` + U+0301 不能繞過 `Password`），避免以此繞過黑名單。執行檔名一律同時比對有、無 `.exe` 的形式（Linux／macOS 的行程名稱是 `keepassxc`、`KeePassXC.app`）。西里爾字母等外觀相同的異體字（homoglyph）不在處理範圍。`self` 只在代理自己的應用程式，或終端機類應用且標題含 Claude Code／Antigravity／Codex 時成立；`nocap` 的網頁版信箱與通訊軟體名稱，必須是標題中以 ` - ` 分隔的獨立一段（`Slack API reference - Chrome` 不算）。完整名單見程式的 `SELF_APPS`、`TERMINAL_APPS`、`NOCAP_APPS`、`TITLE_NOCAP`。
 
 ---
 
@@ -171,14 +171,16 @@ def sanitize_title(text: str, limit: int = 160) -> str:
 #### F. 本機機密檔案路徑與私鑰檔名
 1.0.0 對所有應用一律用同一條正則，結果任何標題含 `.pem`、`.p12`、`id_rsa` 的視窗（例如瀏覽器在看 OpenSSL 說明文件）都被阻斷。現拆成兩條，**兩條任一命中即 `blocked`**：
 
-1. 編輯器／檔案總管類應用（`FILE_VIEWER_APPS`：VS Code、Cursor、Notepad、檔案總管等），標題**任何位置**出現機密檔名即阻斷：
+1. 編輯器／檔案總管類應用（`FILE_VIEWER_APPS`：VS Code、Cursor、Notepad、檔案總管等）與終端機（`TERMINAL_APPS`，標題常是正在跑的指令，例如 `nano .env`、`vim ~/.ssh/id_rsa`），標題**任何位置**出現機密檔名即阻斷：
 ```regex
-(?i)(?:(?:^|[\s\\/])\.env(?:\.[\w-]+)?\b|credentials?\.json|secrets?\.(?:json|ya?ml|toml)|\.pem\b|\bid_rsa\b|\.pfx\b|\.p12\b)
+(?i)(?:(?:^|[\s\\/])\.env(?:\.[\w-]+)?\b|credentials?\.json|secrets?\.(?:json|ya?ml|toml)|\.pem\b|\bid_rsa\b|\.pfx\b|\.p12\b|\bid_(?:dsa|ecdsa|ed25519)(?:_sk)?\b|\.(?:ppk|kdbx)\b|(?:^|[\s\\/])\.(?:envrc|netrc|pgpass|git-credentials|npmrc|pypirc)\b|(?:^|[\s\\/])auth\.json\b|[\\/]\.aws[\\/]credentials\b|^credentials(?=\s[-–—]\s|$))
 ```
 2. 其他任何應用（含瀏覽器），標題第一段（第一個 ` - ` 之前）必須**不含空白、且以**該檔名結尾才阻斷。涵蓋瀏覽器直接開啟原始檔、分頁標題就是檔名或網址的情況（`How to convert a .pem file to .pfx - Chrome` 第一段含空白，放行）：
 ```regex
-(?i)(?:(?:^|[\s\\/])\.env(?:\.[\w-]+)?|credentials?\.json|secrets?\.(?:json|ya?ml|toml)|\bid_rsa|\.(?:pem|pfx|p12))$
+(?i)(?:(?:^|[\s\\/])\.env(?:\.[\w-]+)?|credentials?\.json|secrets?\.(?:json|ya?ml|toml)|\bid_rsa|\.(?:pem|pfx|p12)|\bid_(?:dsa|ecdsa|ed25519)(?:_sk)?|\.(?:ppk|kdbx)|(?:^|[\s\\/])\.(?:envrc|netrc|pgpass|git-credentials|npmrc|pypirc)|(?:^|[\\/])auth\.json|[\\/]\.aws[\\/]credentials)$
 ```
+
+涵蓋的檔名（2026-11-21 補齊）：`.env*`、`.envrc`、`credentials.json`、`secrets.*`、`auth.json`、`~/.aws/credentials`（Notepad 標題只顯示 `credentials`，編輯器與終端機標題以它開頭也算）、SSH 私鑰 `id_rsa`／`id_dsa`／`id_ecdsa`／`id_ed25519`（含 `_sk`）、`.pem`／`.pfx`／`.p12`／`.ppk`、KeePass 資料庫 `.kdbx`、`.netrc`、`.pgpass`、`.git-credentials`、`.npmrc`、`.pypirc`。`.key` 刻意不收（Keynote 簡報也是 `.key`）。
 
 取捨：`server.pem - Notepad`、`.env - Visual Studio Code`、瀏覽器分頁 `server.pem`、`secrets.yaml - Mozilla Firefox` 會擋；`How to convert a .pem file - Chrome` 放行。漏網風險：瀏覽器標題的第一段含空白（如 `server.pem (raw) - Chrome`、路徑含空白的檔名）不會被第 2 條擋下。要更保守請把該瀏覽器加進 `FILE_VIEWER_APPS`，代價是看說明文件的瀏覽器分頁也會被擋。
 
@@ -279,11 +281,14 @@ class IncognitoDetector:
 
 ### 5.2 機密憑證與 Token 正則規則表
 
+> **比對前處理（2026-11-21）**：OCR 文字先去掉不可見字元（保留換行與 tab）再做 NFKC，全形英數、零寬字元夾在金鑰中間都不能繞過。有固定前綴的金鑰（`WRAP_JOIN_SECRET_LABELS`：私鑰、Stripe、Anthropic、OpenAI、GitHub、AWS、Google、Slack、Supabase、npm、Hugging Face、SendGrid、GitLab、Webhook、JWT）若被折成兩行（兩行之間只有換行與行尾空白），接回後再比對一次；Bearer、帳密賦值、連線字串、Discord、Telegram 這類泛用規則不接行，避免把相鄰兩行的普通文字接成機密。金鑰中間被 OCR 插入空白（`ghp_ AbC…`）仍會漏抓。
+> **OCR 檔編碼**：`--ocr-file` 依 BOM 解 UTF-8／UTF-16／UTF-32，沒有 BOM 但一半是 NUL 時當 UTF-16（PowerShell 5 的 `>`、`Out-File` 預設寫 UTF-16LE）。以上都解不開（例如 cp950）就輸出 `action: drop_image` 並不印文字：關鍵字、機密都可能比對不到，無法判斷就丟圖。
+
 > **表格寫法與實際使用**：表格內的 `\|` 是 markdown 表格的跳脫，**實際使用時要改回 `|`**（程式常數 `SECRET_RULES` 是已還原的形式）。規則**依表格順序先到先遮**：`sk-ant-` 必須排在 `sk-` 前面，否則 Anthropic 金鑰會被 OpenAI 規則吃掉、`[Anthropic金鑰]` 標籤形同虛設。
 
 | 憑證類別 | 正規表示式 (Regex) | 遮蔽替代詞 | 洩漏處置動作 |
 | :--- | :--- | :--- | :--- |
-| **私鑰區塊** | `-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----` | `[私鑰]` | **Drop Image** |
+| **私鑰區塊** | `-----BEGIN[ \t]+(?:[A-Z0-9]+[ \t]+){0,4}PRIVATE[ \t]+KEY-----` | `[私鑰]` | **Drop Image** |
 | **Stripe API Key** | `(?<![A-Za-z0-9_])[sr]k_(?:live\|test)_[A-Za-z0-9]{16,}(?![A-Za-z0-9_])` | `[Stripe金鑰]` | **Drop Image** |
 | **Anthropic API Key** | `(?<![A-Za-z0-9_])sk-ant-[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_])` | `[Anthropic金鑰]` | **Drop Image** |
 | **OpenAI API Key** | `(?<![A-Za-z0-9_])sk-(?:proj-\|admin-)?[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_])` | `[OpenAI金鑰]` | **Drop Image** |

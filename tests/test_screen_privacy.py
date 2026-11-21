@@ -542,6 +542,147 @@ class ReviewFindingRegressionTest(unittest.TestCase):
         self.assertEqual(sp.redact_text(text), text)
 
 
+class Review20261121ScreenPrivacyTest(unittest.TestCase):
+    """2026-11-21 攻擊者角度覆核（REVIEW.md S-1～S-7）找到的繞過，每一項都要維持修正。"""
+
+    GH = fake("gh", "p_", "A1b2C3d4" * 5)
+    ANT = fake("sk-", "ant-", "api03-", "A" * 40, "b" * 50)
+
+    def assertDropped(self, text):
+        self.assertEqual(sp.inspect_ocr_text(text), (True, sp.ACTION_DROP), repr(text[:40]))
+
+    def test_fullwidth_nbsp_and_spacing_variants_of_blocked_titles(self):
+        def full(s):
+            return "".join(chr(ord(c) + 0xFEE0) if "!" <= c <= "~" else c for c in s)
+        for app, title in [
+            ("chrome.exe", full("Incognito")),
+            ("chrome.exe", "New Tab - Google Chrome (" + full("Incognito") + ")"),
+            ("chrome.exe", "My Online\u00a0Banking - Chrome"),
+            ("chrome.exe", "My Online  Banking - Chrome"),
+            ("chrome.exe", "My Online\u3000Banking - Chrome"),
+            ("chrome.exe", full("Patient") + " list - Chrome"),
+            ("chrome.exe", "\uff76\uff99\uff83 - Chrome"),  # 半形片假名「カルテ」
+            ("chrome.exe", full("1Password")),
+            ("chrome.exe", "P\u0301assword Manager - Chrome"),
+            ("code.exe", full("secrets.json") + " - Visual Studio Code"),
+        ]:
+            with self.subTest(title=title):
+                self.assertEqual(sp.classify_window(app, title), "blocked")
+
+    def test_app_names_without_exe_suffix(self):
+        # Linux／macOS 的行程名稱沒有 .exe
+        for app in ("keepassxc", "1password", "bitwarden", "KeePassXC.app", "/usr/bin/keepassxc"):
+            with self.subTest(app=app):
+                self.assertEqual(sp.classify_window(app, "Untitled"), "blocked")
+        self.assertEqual(sp.classify_window("slack", "general"), "nocap")
+        self.assertEqual(sp.classify_window("claude", "session"), "self")
+        self.assertEqual(sp.classify_window("code", "id_ed25519 - x - Visual Studio Code"), "blocked")
+
+    def test_more_secret_file_names(self):
+        for app, title in [
+            ("notepad.exe", "id_ed25519 - Notepad"),
+            ("notepad.exe", "id_ecdsa - Notepad"),
+            ("chrome.exe", "id_ed25519"),
+            ("code.exe", "server.ppk - Visual Studio Code"),
+            ("keepassxc-cli", "vault.kdbx"),
+            ("chrome.exe", "vault.kdbx - KeeWeb - Chrome"),
+            ("code.exe", ".envrc - proj - Visual Studio Code"),
+            ("code.exe", ".netrc - Visual Studio Code"),
+            ("code.exe", ".pgpass - Visual Studio Code"),
+            ("code.exe", ".git-credentials - Visual Studio Code"),
+            ("code.exe", ".npmrc - proj - Visual Studio Code"),
+            ("code.exe", ".pypirc - Visual Studio Code"),
+            ("code.exe", "auth.json - .codex - Visual Studio Code"),
+            ("notepad.exe", r"C:\Users\x\.aws\credentials - Notepad"),
+            ("chrome.exe", "file:///home/x/.aws/credentials"),
+            ("notepad.exe", "credentials - Notepad"),  # Notepad 只顯示檔名：~/.aws/credentials
+            ("code.exe", "credentials - .aws - Visual Studio Code"),
+        ]:
+            with self.subTest(title=title):
+                self.assertEqual(sp.classify_window(app, title), "blocked")
+        self.assertEqual(sp.classify_window("chrome.exe", "How to use id_ed25519 keys - Chrome"), "ok")
+        self.assertEqual(sp.classify_window("code.exe", "auth.ts - proj - Visual Studio Code"), "ok")
+        self.assertEqual(sp.classify_window("notepad.exe", "my credentials notes - Notepad"), "ok")
+        self.assertEqual(sp.classify_window("notepad.exe", "credentials.txt - Notepad"), "ok")
+        self.assertEqual(sp.classify_window("chrome.exe", "credentials - Google Chrome"), "ok")
+
+    def test_terminal_titles_showing_a_secret_file_are_blocked(self):
+        for title in ("nano .env", "vim ~/.ssh/id_rsa", "less /home/x/.aws/credentials", "cat .git-credentials",
+                      "vim ~/.ssh/id_ed25519", "nano server.ppk", "keepassxc-cli open vault.kdbx",
+                      "code ~/.npmrc", "cat ~/.netrc", "type C:\\x\\auth.json"):
+            with self.subTest(title=title):
+                self.assertEqual(sp.classify_window("WindowsTerminal.exe", title), "blocked")
+        self.assertEqual(sp.classify_window("WindowsTerminal.exe", "npm run build"), "ok")
+
+    def test_key_wrapped_across_ocr_lines_is_dropped(self):
+        for cut in (10, 20, 30):
+            with self.subTest(cut=cut):
+                self.assertDropped(self.ANT[:cut] + "\n" + self.ANT[cut:])
+                self.assertDropped("token " + self.ANT[:cut] + "  \r\n  " + self.ANT[cut:] + " end")
+        self.assertDropped(self.GH[:12] + "\n" + self.GH[12:])
+        aws = fake("AKIA", "IOSFODNN7EXAMPLE")
+        self.assertDropped(aws[:8] + "\n" + aws[8:])
+        # 一般換行的文字不會被接成金鑰
+        self.assertEqual(sp.inspect_ocr_text("sk-learn is a library\nfor machine learning in python"),
+                         (False, sp.ACTION_PASS))
+
+    def test_fullwidth_and_invisible_characters_in_ocr_text(self):
+        aws = fake("AKIA", "IOSFODNN7EXAMPLE")
+        self.assertDropped("".join(chr(ord(c) + 0xFEE0) for c in aws))
+        self.assertDropped(self.GH[:6] + "\u200b" + self.GH[6:])
+        self.assertDropped(self.ANT[:15] + "\u2060" + self.ANT[15:])
+        self.assertDropped("身分證：\uff21123456789")
+        self.assertDropped("身分證：\uff21\uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19")
+        self.assertDropped("4111\u00a01111\u00a01111\u00a01111")
+        self.assertDropped("4111\u30001111\u30001111\u30001111")
+        self.assertDropped("-----BEGIN  RSA  PRIVATE  KEY-----")
+        # 脫敏輸出不能把零寬字元藏著的機密原樣吐出
+        self.assertNotIn(self.GH[6:], sp.redact_text("x " + self.GH[:6] + "\u200b" + self.GH[6:]))
+
+    def run_cli(self, *args):
+        env = {**os.environ, "PYTHONIOENCODING": "cp950", "PYTHONUTF8": "0"}
+        proc = subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, env=env, timeout=60)
+        return proc.returncode, proc.stdout.decode("utf-8"), proc.stderr.decode("utf-8", "replace")
+
+    def test_utf16_and_bom_ocr_files_are_decoded(self):
+        # PowerShell 5 的 > 與 Out-File 預設寫 UTF-16LE＋BOM；當 UTF-8 讀會讓機密逃過比對、還被原樣印出
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ocr.txt"
+            for encoding in ("utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-8-sig"):
+                with self.subTest(encoding=encoding):
+                    # utf-16-le／-be 沒有 BOM：ASCII 為主時一半是 NUL，也要認得
+                    path.write_bytes(("key: " + self.GH + "\n").encode(encoding))
+                    code, out, _ = self.run_cli("--ocr-file", str(path))
+                    self.assertEqual(code, 0)
+                    self.assertIn("action: drop_image", out)
+                    self.assertNotIn(self.GH[5:20], out.replace("\x00", ""))
+
+    def test_utf16_without_bom_keeps_chinese_text(self):
+        # 沒有 BOM 的 UTF-16LE：要真的照 UTF-16 解，中文才讀得到（只把 NUL 拿掉會變成無法解碼而誤丟）
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ocr.txt"
+            path.write_bytes("build ok 建置完成 all tests passed\n".encode("utf-16-le"))
+            code, out, _ = self.run_cli("--ocr-file", str(path))
+        self.assertEqual(code, 0)
+        self.assertIn("action: pass", out)
+        self.assertIn("建置完成", out)
+
+    def test_fullwidth_titles_for_self_and_nocap(self):
+        def full(s):
+            return "".join(chr(ord(c) + 0xFEE0) if "!" <= c <= "~" else c for c in s)
+        self.assertEqual(sp.classify_window("chrome.exe", "Inbox - " + full("Gmail") + " - Chrome"), "nocap")
+        self.assertEqual(sp.classify_window("pwsh.exe", full("Claude") + "　" + full("Code")), "self")
+
+    def test_undecodable_ocr_file_is_dropped_not_passed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ocr.txt"
+            path.write_bytes("病歷 診斷 處方".encode("cp950"))
+            code, out, _ = self.run_cli("--ocr-file", str(path))
+        self.assertEqual(code, 0)
+        self.assertIn("action: drop_image", out)
+        self.assertNotIn("redacted:", out)
+
+
 class CliTest(unittest.TestCase):
     def test_drop_reason_names_the_pii_category(self):
         with tempfile.TemporaryDirectory() as tmp:
