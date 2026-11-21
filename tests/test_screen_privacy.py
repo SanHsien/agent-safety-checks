@@ -630,6 +630,8 @@ class Review20261121ScreenPrivacyTest(unittest.TestCase):
         aws = fake("AKIA", "IOSFODNN7EXAMPLE")
         self.assertDropped("".join(chr(ord(c) + 0xFEE0) for c in aws))
         self.assertDropped(self.GH[:6] + "\u200b" + self.GH[6:])
+        self.assertDropped(self.GH[:6] + "\x00" + self.GH[6:])  # \u7d14 ASCII \u7684\u5feb\u901f\u8def\u5f91\u4e5f\u8981\u53bb\u63a7\u5236\u5b57\u5143
+        self.assertDropped(self.GH[:6] + "\x08" + self.GH[6:])
         self.assertDropped(self.ANT[:15] + "\u2060" + self.ANT[15:])
         self.assertDropped("身分證：\uff21123456789")
         self.assertDropped("身分證：\uff21\uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19")

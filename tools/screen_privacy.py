@@ -16,6 +16,7 @@ tools/screen_privacy.py
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import sys
 import unicodedata
@@ -263,7 +264,7 @@ _OCR_LINE_WRAP = re.compile(r"(?<=[A-Za-z0-9_\-])[ \t]*\r?\n[ \t]*(?=[A-Za-z0-9_
 def _compile_all() -> None:
     """依目前的常數（重新）編譯正則。測試或實驗替換常數後可再呼叫。"""
     global _TITLE_BLOCKED, _TITLE_FILE_ANY, _TITLE_FILE_END, _TITLE_SELF, _TITLE_NOCAP
-    global _SECRETS, _PII
+    global _SECRETS, _PII, _WRAP_JOIN_SECRETS
     _TITLE_BLOCKED = [
         re.compile(p)
         for p in (TITLE_MEDICAL, TITLE_PRIVATE_BROWSING, TITLE_PASSWORD_MANAGER, TITLE_BANKING, TITLE_ADULT)
@@ -273,6 +274,9 @@ def _compile_all() -> None:
     _TITLE_SELF = re.compile(TITLE_SELF)
     _TITLE_NOCAP = re.compile(TITLE_NOCAP)
     _SECRETS = [(label, re.compile(p), repl) for label, p, repl in SECRET_RULES]
+    _WRAP_JOIN_SECRETS = [r for r in _SECRETS if r[0] in WRAP_JOIN_SECRET_LABELS]
+    if "_cached_redact_secrets" in globals():
+        _cached_redact_secrets.cache_clear()  # 測試替換常數後重新編譯，快取不能留舊結果
     _PII = [(label, re.compile(p), repl) for label, p, repl in PII_RULES]
 
 
@@ -342,9 +346,16 @@ def classify_window(app: str, title: str) -> str:
 # 第 5 節：OCR 檢查與脫敏
 # --------------------------------------------------------------------------
 
+_ASCII_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
 def prepare_ocr_text(text: Optional[str]) -> str:
-    """比對前的 OCR 文字：去掉零寬、雙向覆寫等不可見字元（保留換行與 tab），再做 NFKC（全形英數、NBSP、全形空白）。"""
-    return unicodedata.normalize("NFKC", _drop_invisible(text or "", keep="\n\r\t"))
+    """比對前的 OCR 文字：去掉零寬、雙向覆寫等不可見字元（保留換行與 tab），再做 NFKC（全形英數、NBSP、全形空白）。
+    純 ASCII 時 NFKC 不會改變任何字，只需去控制字元（快速路徑，結果相同）。"""
+    text = text or ""
+    if text.isascii():
+        return _ASCII_CONTROL.sub("", text)
+    return unicodedata.normalize("NFKC", _drop_invisible(text, keep="\n\r\t"))
 
 
 def _join_wrapped_lines(text: str) -> str:
@@ -363,13 +374,20 @@ def _redact_with(rules, text: str) -> Tuple[str, List[str]]:
 def redact_secrets(text: str) -> Tuple[str, List[str]]:
     """依 SECRET_RULES 順序遮蔽機密，回傳（遮蔽後文字, 命中的標籤）。
     文字先經 prepare_ocr_text；有固定前綴的金鑰若被折成兩行，接回後也算命中（此時回傳接行後的文字）。"""
+    masked, hits = _cached_redact_secrets(text or "")
+    return masked, list(hits)
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_redact_secrets(text: str) -> Tuple[str, Tuple[str, ...]]:
+    # inspect_ocr_text、CLI 的 reasons、redact_text 會對同一段文字各呼叫一次；長 OCR 文字只算一次
     masked, hits = _redact_with(_SECRETS, prepare_ocr_text(text))
-    joined_masked, wrapped = _redact_with(
-        [r for r in _SECRETS if r[0] in WRAP_JOIN_SECRET_LABELS], _join_wrapped_lines(masked))
-    if wrapped:
-        masked = joined_masked
-        hits += [label for label in wrapped if label not in hits]
-    return masked, hits
+    if _OCR_LINE_WRAP.search(masked):
+        joined_masked, wrapped = _redact_with(_WRAP_JOIN_SECRETS, _join_wrapped_lines(masked))
+        if wrapped:
+            masked = joined_masked
+            hits += [label for label in wrapped if label not in hits]
+    return masked, tuple(hits)
 
 
 def scan_secrets(text: str) -> List[str]:
