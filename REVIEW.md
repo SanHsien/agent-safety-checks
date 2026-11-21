@@ -30,6 +30,7 @@
 | C-1 | 中 | MCP 設定 `"env":{"API_KEY":"ghp_…"},"env":{}`（帳號 JSON 同理） | 只看到最後的空 `env`，PASS、結束碼 0；憑證仍在檔案上 | 重複鍵回 2 | `022d23f`（2026-11-21） |
 | C-2 | 中 | Claude Code `~/.claude.json` 的 `projects.<路徑>.mcpServers` 寫死憑證；VS Code `settings.json` 的 `mcp.servers` | 只看根層，結束碼 0（根層有其他 server）或 2 | 任何深度的 `mcpServers` 與 `mcp.servers` 都掃，結束碼 1 | `022d23f`（2026-11-21） |
 | C-3 | 中 | `"command":"npx srv --token ghp_…"`、`args: ["--api-key", "…"]`、`--token=…`、`oauth.clientSecret`、`auth.value`、`cwd` 裡的金鑰 | 全部漏報 | 結束碼 1；`--token-file`、`--max-tokens`、`tokenUrl` 這類設定不報 | `022d23f`（2026-11-21） |
+| C-8 | 中 | ai-inbox REVIEW.md 16.2（T-20261107-05）追加：`args: ["mcp-remote", "https://…", "--header", "X-Api-Key:<32 位 hex>"]`、`-H X-Auth-Token:…`、`--header=X-Api-Key:…`、`command` 字串裡的同樣寫法（`--api-key=<hex>` 已由 C-3 修掉） | `--header` 寫法 exit 0（headers／env 的敏感鍵名規則沒套到 args） | 名稱帶 token／key／secret／password／credential／cookie 的標頭值非佔位符就報，結束碼 1；`Accept: application/json`、`X-Api-Key:${API_KEY}` 不報 | `79b2788`（2026-11-21） |
 | C-4 | 中 | 未列名鍵底下的 Google `AIza…`（Gemini／Vertex 金鑰，正是 LLMJacking 案例）、`gho_`／`ghs_`／`ghu_`／`ghr_`、`ASIA`、`glpat-`、`hf_`、`npm_`、`xoxs-`／`xapp-`、`sk_live_`、私鑰區塊；`Cookie` 標頭；`<ghp_…>` | 漏報（`<…>` 被當佔位符豁免） | 結束碼 1 | `022d23f`（2026-11-21） |
 | C-5 | 低 | 角色 `" roles/owner"`、`roles/iam.serviceAccountTokenCreator`、`serviceAccountUser`、`workloadIdentityUser` | 不算高權限 | 標記 | `022d23f`（2026-11-21） |
 | C-6 | 低 | 2 萬個同一秒建立的帳號 | 激增檢查 O(n²)，28.7 秒 | 線性，0.1 秒 | `022d23f`（2026-11-21） |
@@ -60,9 +61,9 @@
 | S-5 | 中 | `id_ed25519 - Notepad`、`server.ppk`、`vault.kdbx`、`.envrc`、`.netrc`、`.pgpass`、`.git-credentials`、`.npmrc`、`.pypirc`、`auth.json`、`credentials - Notepad`（`~/.aws/credentials`）；終端機標題 `nano .env` | `ok` | `blocked`；`.key` 刻意不收（Keynote） | `cd94185`（2026-11-21） |
 | S-6 | 低 | `-----BEGIN  RSA  PRIVATE  KEY-----`（OCR 多出空白） | `pass` | `drop_image` | `cd94185`（2026-11-21） |
 
-能力邊界（未改，README、規範已寫）：金鑰中間被插入空白、卡號用兩個以上空白或句點分隔、西里爾字母等異體字、第二層 UIA 未實作、結束碼不反映判斷結果。效能：600 KB 對抗輸入最慢約 6.7 秒（修前約 4.9 秒），隨長度線性；既有 1 秒 ReDoS 測試仍通過。
+能力邊界（未改，README、規範已寫）：金鑰中間被插入空白、卡號用兩個以上空白或句點分隔、西里爾字母等異體字、第二層 UIA 未實作、結束碼不反映判斷結果。效能：S-1～S-6 讓既有 ReDoS 樣本變慢約一倍（機器忙碌時 1 秒門檻測試會偶發紅燈），已補純 ASCII 快速路徑、同一段文字只算一次、只在有換行折斷時才接行，40 KB 樣本降到 0.03～0.06 秒（修前約 0.04～0.07 秒）；修復 `57b4bf1`（2026-11-21）。
 
 ### Mutation 與誤報
 
-- Mutation：50 個突變（每個修正至少一個：把條件改成恆假、刪掉新增的樣式或鍵名、還原舊的解碼與正規化）全部讓對應測試模組轉紅。第一輪有 2 個存活（無 BOM UTF-16 只拿掉 NUL 也能讀 ASCII；標題的去附加符號版本已涵蓋全形），補了 `test_utf16_without_bom_keeps_chinese_text`、`test_fullwidth_titles_for_self_and_nocap` 後轉紅。
+- Mutation：57 個突變（含 C-8 的 3 個、效能修正後 OCR 路徑的 4 個）（每個修正至少一個：把條件改成恆假、刪掉新增的樣式或鍵名、還原舊的解碼與正規化）全部讓對應測試模組轉紅。第一輪有 2 個存活（無 BOM UTF-16 只拿掉 NUL 也能讀 ASCII；標題的去附加符號版本已涵蓋全形），補了 `test_utf16_without_bom_keeps_chinese_text`、`test_fullwidth_titles_for_self_and_nocap` 後轉紅。
 - 本機真實無害資料（只看計數，不輸出內容）：目前桌面視窗、`~/.claude/skills` 下 459 個檔名當標題、同批檔案內文當 OCR、Run keys、Startup 資料夾、`~/.claude.json` 的 MCP 設定、預設的 OAuth 稽核。修前修後結果相同：視窗分類不變、檔名標題只有 1 個 `blocked`（本來就有）、內文 `drop_image` 17 個（本來就有，都是文件裡的範例憑證與身分證樣式）、Run keys／Startup／`~/.claude.json` 都 PASS、OAuth 稽核 0 ERROR／3 WARN。
