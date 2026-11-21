@@ -23,10 +23,10 @@
 | 指令 | 用途 | 結束碼 |
 |------|------|--------|
 | `python tools/verify_agent_skill_pack_safety.py --pack <目錄>` | 採納前靜態掃描技能包（可重複 `--pack`；另有 `--strict`、`--json`、`--max-bytes`、`--ack-unscanned`；`--config`／`--self-test` 只檢查自述宣告，不能當採納依據） | 0 通過；1 有 FAIL（`--strict` 時 REVIEW 也算）；2 輸入錯誤或無法掃描（裸執行、目錄不存在或為空、有未掃描檔且未確認） |
-| `python tools/verify_tool_call_firewall.py --verify-calls <json>` / `--analyze-trace <json>` | 驗證工具呼叫的單次審批收據與請求雜湊；分析 Agent trace 的 span 去重耗時與 token | 0 全部通過；1 有呼叫被拒；2 沒給參數、檔案不存在或無法讀取，或 JSON／schema 無效 |
-| `python tools/verify_cloud_persistence_audit.py --scan-dir <目錄>` / `--scan-run-keys` / `--audit-accounts-json <json>` / `--audit-mcp-config <json>` | 本機竊密木馬特徵檔名、Windows Run keys、雲端 Service Account 異常、MCP 設定寫死的憑證 | 0 所選檢查未命中；1 規則命中；2 輸入或讀取失敗、沒選任何檢查，或所選檢查全被跳過（例如非 Windows 只選 `--scan-run-keys`） |
-| `python tools/audit_oauth_credentials.py [--home DIR] [--dir DIR] [--repo DIR] [--strict] [--json]` | 本機 AI 工具 OAuth 憑證檔放置是否安全（位置、權限／ACL、git 狀態、監聽位址）；只讀 metadata，不輸出 token | 0 通過（只有 WARN／INFO）；1 有 ERROR，或 `--strict` 且有 WARN；2 參數錯誤或 `--home` 目錄不存在 |
-| `python tools/screen_privacy.py --title <標題> [--app <exe>]` / `--ocr-file <txt>` | 截圖前判斷視窗類別（`blocked`／`self`／`nocap`／`ok`）；截圖後判斷 OCR 文字要不要丟圖，並輸出脫敏文字 | 0 執行成功（**判斷結果在 stdout，不在結束碼**：`blocked` 與 `action: drop_image` 也回 0）；2 沒給 `--title`／`--ocr-file`、或讀不到 OCR 檔 |
+| `python tools/verify_tool_call_firewall.py --verify-calls <json>` / `--analyze-trace <json>` | 驗證工具呼叫的單次審批收據與請求雜湊；分析 Agent trace 的 span 去重耗時與 token | 0 全部通過；1 有呼叫被拒；2 沒給參數、檔案不存在或無法讀取，或 JSON／schema 無效（含重複鍵、巢狀過深） |
+| `python tools/verify_cloud_persistence_audit.py --scan-dir <目錄>` / `--scan-run-keys` / `--audit-accounts-json <json>` / `--audit-mcp-config <json>` | 本機竊密木馬特徵檔名、Windows Run keys、雲端 Service Account 異常、MCP 設定寫死的憑證 | 0 所選檢查未命中；1 規則命中；2 輸入或讀取失敗（含 JSON 重複鍵）、沒選任何檢查，或所選檢查全被跳過（例如非 Windows 只選 `--scan-run-keys`） |
+| `python tools/audit_oauth_credentials.py [--home DIR] [--dir DIR] [--repo DIR] [--strict] [--json]` | 本機 AI 工具 OAuth 憑證檔放置是否安全（位置、權限／ACL、git 狀態、監聽位址）；只讀 metadata，不輸出 token | 0 通過（只有 WARN／INFO）；1 有 ERROR，或 `--strict` 且有 WARN；2 參數錯誤、`--home` 目錄不存在，或 `--repo` 列不出追蹤檔（不是 git repo、沒有 git） |
+| `python tools/screen_privacy.py --title <標題> [--app <exe>]` / `--ocr-file <txt>` | 截圖前判斷視窗類別（`blocked`／`self`／`nocap`／`ok`）；截圖後判斷 OCR 文字要不要丟圖，並輸出脫敏文字 | 0 執行成功（**判斷結果在 stdout，不在結束碼**：`blocked` 與 `action: drop_image` 也回 0；OCR 檔編碼認不出來也是 `drop_image`）；2 沒給 `--title`／`--ocr-file`、或讀不到 OCR 檔 |
 
 呼叫端必須讀 `screen_privacy.py` 的 stdout（`classification:`、`action:`），不能只看結束碼。
 
@@ -95,25 +95,40 @@ python -m unittest discover -s tests
 ### verify_tool_call_firewall.py
 - 審批收據只是請求內容的 SHA-256 雜湊，**沒有簽章**：任何能呼叫 `issue_approval_receipt` 的人都能自己造收據。它防的是「審批後內容被改」與「同一張收據重放」，不防偽造審批。
 - 單次使用只在單次執行（單一行程、單一批次檔）內記錄，不跨行程持久化。
-- 只認內建的五種工具名稱與各自的欄位白名單；路徑只做邏輯檢查，不確認實體檔案系統上的符號連結。
+- 只認內建的五種工具名稱與各自的欄位白名單。路徑在驗證當下 `resolve()`（會跟著符號連結與 junction），但驗證與實際執行之間連結被換掉（TOCTOU）擋不住。
+- 路徑拒絕：`..`、絕對／UNC／磁碟機路徑、`:`（替代資料串流）、結尾點或空白、8.3 短名、保留裝置名（含 `CONIN$`、`CONOUT$`、`COM0`～`COM9`、`COM¹`～`COM³`、`LPT` 同組）、控制字元、`<>"|?*`，以及看起來像 `/ \ . :` 的 Unicode 字元（全形、`∕`、`¥`、`₩` 等；Windows ANSI best-fit 會把它們轉成真的分隔符）。
+- 驗證檔裡同一物件有重複鍵一律回 2：取第一個值與取最後一個值的執行端會看到不同的呼叫。
+- 反斜線一律當路徑分隔符正規化；在 Linux 上 `src\a.py` 其實是工作區根目錄下的單一檔名，執行端若不做同樣正規化會寫到別處。允許的根目錄本身（`src`）也算在範圍內。
 - trace 分析是算術去重，不判斷 span 內容是否可信。
 - 檔案不存在、路徑不是檔案或無法讀取時回 2（無法判斷），不算規則命中。
 
 ### verify_cloud_persistence_audit.py
 - 離線啟發式，不判定感染，也不判定帳號授權是否合法。
-- `--scan-dir` 只比對已知檔名清單，不自動發現 LaunchAgents／Startup；改名的木馬抓不到。
+- `--scan-dir` 只比對已知檔名清單，不自動發現 LaunchAgents／Startup；改名的木馬抓不到。目錄連結（符號連結、junction）會跟進去，以實際路徑去重避免繞圈。
+- `--scan-run-keys` 只看 HKCU／HKLM 的 `Run`、`RunOnce`；`RunOnceEx`、`Policies\Explorer\Run`、Winlogon、排程工作、服務不在範圍。
 - 帳號資料的 `createTime` 要由外部補入（IAM v1 匯出本身沒有），`has_user_managed_keys` 不是遠端金鑰查證。
-- MCP 檢查不是完整 schema 驗證；只豁免完整的 `${VAR}`、`$VAR`、`%VAR%`、`{{VAR}}`、`<VAR>` 佔位符；憑證樣式只比對固定幾種前綴與鍵名。
+- 高權限角色：`roles/owner`／`editor`／`admin`，名稱含 `admin`、`vertex`、`aiplatform`，以及可冒用身分的 `serviceAccountTokenCreator`、`serviceAccountUser`、`workloadIdentityUser`；自訂角色只看名稱，不展開權限。
+- MCP 檢查不是完整 schema 驗證。掃描範圍：根層 `mcpServers`／`servers`、VS Code 的 `mcp.servers`，以及任何深度的 `mcpServers`（例如 Claude Code `~/.claude.json` 的 `projects.<路徑>.mcpServers`）；每個 server 的 `headers`、`env`、`args`、`command`、網址欄位，其他欄位與巢狀物件（`oauth`、`auth`、`cwd`…）也比對已知 token 樣式與敏感鍵名。
+- 佔位符：只豁免完整的 `${VAR}`、`$VAR`、`%VAR%`、`{{VAR}}`、`<VAR>`；但 `<…>`、`{{…}}` 裡若是已知 token 樣式照報。憑證樣式只比對固定前綴（GitHub `ghp_`／`gho_`／`ghs_`／`ghu_`／`ghr_`／`github_pat_`、`sk-`、`sk-ant-`、Google `AIza`、`ya29.`、AWS `AKIA`／`ASIA`、Slack、GitLab、Hugging Face、npm、Stripe live、私鑰區塊）與鍵名、`--api-key 值`／`--token=值` 旗標；拆成多個參數、存在其他檔案、經 shell 變數組出來的值抓不到。
+- 同一物件有重複鍵（JSON 解析器取前、取後不一致）一律回 2。
 
 ### audit_oauth_credentials.py
 - 只看 metadata，不驗證 token 是否仍有效。
 - 無 BOM 的 UTF-16 若以非 ASCII 字元為主，或無 BOM 的 UTF-32，會被當 UTF-8 而**漏報**。
 - 預設只掃各目錄第一層與 `oauth-proxy/`，不遞迴；只認 Grok CLI、Codex、Claude Code 的預設位置，其他工具要用 `--dir` 指定。
-- Windows ACL 靠 `icacls`，git 狀態靠 `git`；不在 PATH 時降為 INFO，不會失敗。
+- Windows ACL 靠 `icacls`，git 狀態靠 `git`；不在 PATH 時降為 INFO，不會失敗（`--repo` 例外：列不出追蹤檔回 2）。
+- 所有 git 呼叫都加 `-c core.fsmonitor=false`：被稽核的目錄若在來路不明的 repo 裡，repo 設定的 `core.fsmonitor` 不會被執行。
+- 名稱像憑證檔卻讀不到內容（超過 1 MB、被鎖、沒權限）時列 WARN，權限／ACL／git 照查；讀不到 ACL（`icacls` 失敗）仍是 INFO。
+- 憑證欄位只認固定鍵名（`access_token`、`refresh_token`、`api_key`、`client_secret`、`password`、`private_key`、`authorization` 等，camelCase 也算）；值換到下一行只認引號字串。JSON 的 `\u` 跳脫鍵名、只授權給特定其他帳號的 ACL 抓不到。
+- `--repo` 另查被追蹤的 `.env`、`.env.*`、`*.env`：有明文值才報 ERROR；名稱含 `example`、`sample`、`template` 的範本不看。
 
 ### screen_privacy.py
 - 只實作純文字、跨平台的兩層：視窗標題分類與 OCR 文字檢查。第二層（Windows UIA 無障礙樹探測）需要 COM，**未提供實作**。
 - 看不到像素：圖片本身（未經 OCR 的畫面、手寫、截斷的金鑰）不在範圍；OCR 錯字會讓金鑰比對漏掉。
+- 比對前會去不可見字元、做 NFKC（全形英數、半形片假名、NBSP、全形空白）、收斂空白；標題另比一份去掉組合附加符號的版本。西里爾字母等外觀相同的異體字（homoglyph）抓不到。
+- 有固定前綴的金鑰被折成兩行會接回來比對；金鑰中間被 OCR 插入空白（`ghp_ AbC…`）、卡號用兩個以上空白或句點分隔，仍會漏抓。
+- `--ocr-file` 依 BOM 解 UTF-8／UTF-16／UTF-32，沒有 BOM 的 UTF-16 以 NUL 比例判斷；都解不開就輸出 `drop_image`，不印文字。
+- 執行檔名同時比對有、無 `.exe`（Linux／macOS 行程名稱）；終端機與編輯器一樣，標題任何位置出現機密檔名就擋。
 - 標題黑名單與機密正則是有限清單，新服務或新金鑰格式要有人加規則。
 - 結束碼不反映判斷結果，見上方工具表。
 

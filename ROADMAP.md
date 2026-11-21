@@ -5,6 +5,7 @@
 
 ## 現況
 本機 AI agent 安全檢查工具集（五支工具，只用 Python 標準函式庫），2026-11-14 自 ai-inbox 抽出成獨立的公開 repo（`gh repo view`），MIT 授權。`c44b226` 的 CI（ubuntu／windows，Python 3.11）為 success（`gh run list`，2026-11-15）。2026-11-15 依艦隊標準補上 Dependabot（只追 GitHub Actions）與 CodeQL（python、actions）；沒有套件 manifest，依賴新鮮度與歷史壓縮以 `.github/dependabot.yml` 的 waiver 註明理由。
+2026-11-21 以攻擊者角度覆核技能包掃描器以外的四支工具，發現與修復紀錄見 [REVIEW.md](REVIEW.md)。
 
 ## 近期：可以直接動手
 
@@ -34,6 +35,10 @@
 | `verify_cloud_persistence_audit`：`--scan-dir` 只比對固定檔名，不自動發現啟動資料夾 | 自動發現會讀使用者全域位置，擴大副作用面；呼叫端明確指定目錄 | 要改變決定，先改這一列再動手 |
 | `audit_oauth_credentials`：無 BOM 的非 ASCII UTF-16、無 BOM 的 UTF-32 會漏報 | 無 BOM 時無法可靠判斷編碼；PowerShell 5 的輸出有 BOM，不屬此情況 | 要改變決定，先改這一列再動手 |
 | `screen_privacy`：第二層（Windows UIA 無障礙樹）未實作 | 需要 COM，無法跨平台、純標準庫實作與測試 | 要改變決定，先改這一列再動手 |
+| `screen_privacy`：OCR 在金鑰中間插入的空白、卡號用兩個以上空白或句點分隔，不去空白重組 | 去掉空白再比對會把一般文字接成假金鑰（`sk-learn is …`），句點分隔會讓小數、版本號誤中卡號；只接回換行折斷的有前綴金鑰 | 實際 OCR 輸出裡反覆出現這種漏抓 |
+| `screen_privacy`：不處理西里爾字母等外觀相同的異體字（homoglyph） | 對照表龐大，套到標題與 OCR 文字會大量誤判；NFKC 已處理全形、半形與相容字元 | 要改變決定，先改這一列再動手 |
+| `verify_tool_call_firewall`：反斜線一律當路徑分隔符正規化（POSIX 上 `src.py` 其實是單一檔名） | 呼叫端多為 Windows；改成依平台判斷會讓同一張收據在兩個平台結果不同 | 有在 Linux 上執行寫入的呼叫端 |
+| `audit_oauth_credentials`：`icacls` 讀不到 ACL 維持 INFO | 讀不到 ACL 通常是權限比目前帳號更嚴，不是外露；既有契約與測試固定為 INFO | 要改變決定，先改這一列再動手 |
 | `screen_privacy`：結束碼不反映判斷結果（blocked 也回 0） | 沿用既有呼叫端的契約，判斷結果在 stdout；改動會破壞既有整合，需要時另開新旗標而不是改預設 | 要改變決定，先改這一列再動手 |
 
 ## 維護方式

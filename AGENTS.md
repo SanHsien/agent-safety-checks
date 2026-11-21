@@ -38,4 +38,5 @@ docs/     multimodal-screen-privacy-spec.md（screen_privacy.py 的規範，以�
 .github/dependabot.yml         只追 GitHub Actions；freshness、multi-commit 的 waiver 與理由也寫在這裡
 README.md   用途、工具表、能力邊界
 ROADMAP.md  後續工作與刻意不做的事（單一真相源）
+REVIEW.md   最近一次覆核的發現與修復 commit（latest-only）
 ```
