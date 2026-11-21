@@ -12,6 +12,7 @@ import tempfile
 import shutil
 import json
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -322,6 +323,135 @@ class McpCredentialRound2(unittest.TestCase):
             r = subprocess.run([sys.executable, '-B', auditor.__file__, '--audit-mcp-config', str(p)], capture_output=True)
             self.assertEqual(r.returncode, 1, r.stdout)
             self.assertNotIn(self.GHP.encode(), r.stdout + r.stderr)
+
+
+class Review20261121CloudAudit(unittest.TestCase):
+    """2026-11-21 攻擊者角度覆核（REVIEW.md C-1～C-7）找到的漏報，每一項都要維持修正。"""
+
+    GHP = "gh" + "p_" + "a" * 36
+    GHO = "gh" + "o_" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+    AIZA = "AI" + "za" + "Sy" + "A" * 33
+    ASIA = "AS" + "IA" + "ABCDEFGHIJKLMNOP"
+
+    def _bad(self, cfg):
+        safe, found = audit_mcp_config_credentials({'mcpServers': {'x': cfg}})
+        self.assertFalse(safe, cfg)
+        return found
+
+    def _good(self, cfg):
+        safe, found = audit_mcp_config_credentials({'mcpServers': {'x': cfg}})
+        self.assertTrue(safe, (cfg, found))
+
+    def test_more_known_token_patterns(self):
+        for token in (self.GHO, "gh" + "s_" + "a" * 36, "gh" + "u_" + "a" * 36, "gh" + "r_" + "a" * 36,
+                      self.AIZA, self.ASIA, "gl" + "pat-" + "a" * 20, "h" + "f_" + "a" * 34,
+                      "np" + "m_" + "a" * 36, "xo" + "xs-" + "1234567890-abc", "xa" + "pp-" + "1-A0B1C2D3E4",
+                      "sk" + "_live_" + "a" * 24, "-----BEGIN " + "PRIVATE KEY-----\nMIIabc"):
+            with self.subTest(token=token[:6]):
+                self._bad({'command': 'x', 'env': {'NOTE': token}})
+                self._bad({'command': 'x', 'args': [token]})
+
+    def test_command_string_is_scanned(self):
+        self._bad({'command': 'npx srv --token ' + self.GHP})
+        self._bad({'command': 'cmd /c srv.exe --header "Authorization: Bearer abcdef0123456789"'})
+        self._bad({'command': 'srv --api-key=' + 'abcdef0123456789xyz'})
+        self._good({'command': 'npx -y @modelcontextprotocol/server-filesystem C:/work'})
+
+    def test_args_sensitive_flag_with_value(self):
+        self._bad({'command': 'npx', 'args': ['--api-key', 'abcdef0123456789xyz']})
+        self._bad({'command': 'npx', 'args': ['--token=abcdef0123456789xyz']})
+        self._bad({'command': 'npx', 'args': ['--client-secret', 'plainsecretvalue']})
+        self._good({'command': 'npx', 'args': ['--api-key', '${API_KEY}']})
+        self._good({'command': 'npx', 'args': ['--token-file', '/run/secrets/token']})
+        self._good({'command': 'npx', 'args': ['--keyboard-layout', 'us', '--max-tokens', '4096']})
+        self._good({'command': 'npx', 'args': ['--api-key', '--verbose']})
+
+    def test_other_fields_and_nested_objects_are_scanned(self):
+        self._bad({'url': 'https://h/mcp', 'oauth': {'clientId': 'abc', 'clientSecret': 'plainsecretvalue'}})
+        self._bad({'url': 'https://h/mcp', 'auth': {'type': 'bearer', 'value': self.GHP}})
+        self._bad({'command': 'x', 'cwd': 'C:/work/' + self.AIZA})
+        self._good({'url': 'https://h/mcp', 'oauth': {'clientId': 'abc', 'tokenUrl': 'https://h/token',
+                                                      'scopes': ['read']}, 'timeout': 30})
+
+    def test_cookie_header_is_a_credential(self):
+        self._bad({'url': 'https://h/mcp', 'headers': {'Cookie': 'session=abcdef0123456789'}})
+        self._good({'url': 'https://h/mcp', 'headers': {'Cookie': '${SESSION_COOKIE}'}})
+
+    def test_known_token_wrapped_in_angle_or_brace_placeholder_still_counts(self):
+        self._bad({'command': 'x', 'env': {'NOTE': '<' + self.GHP + '>'}})
+        self._bad({'command': 'x', 'env': {'NOTE': '{{' + self.GHP + '}}'}})
+
+    def test_nested_project_and_vscode_server_maps_are_scanned(self):
+        claude_json = {'mcpServers': {'a': {'command': 'x'}},
+                       'projects': {'C:/p': {'mcpServers': {'b': {'command': 'x', 'env': {'API_KEY': self.GHP}}}},
+                                    'C:/q': {'mcpServers': {}}}}
+        safe, found = audit_mcp_config_credentials(claude_json)
+        self.assertFalse(safe)
+        self.assertEqual([f['server'] for f in found], ['b'])
+        only_nested = {'projects': {'C:/p': {'mcpServers': {'b': {'command': 'x', 'env': {'API_KEY': self.GHP}}}}}}
+        self.assertFalse(audit_mcp_config_credentials(only_nested)[0])
+        vscode = {'mcp': {'servers': {'b': {'command': 'x', 'env': {'API_KEY': self.GHP}}}}}
+        self.assertFalse(audit_mcp_config_credentials(vscode)[0])
+        clean_nested = {'projects': {'C:/p': {'mcpServers': {'b': {'command': 'x'}}}}}
+        self.assertTrue(audit_mcp_config_credentials(clean_nested)[0])
+        for cfg in ({'projects': {'C:/p': {'mcpServers': {}}}}, {'projects': {'C:/p': {'mcpServers': []}}},
+                    {'projects': {'C:/p': {'mcpServers': {'b': []}}}}):
+            with self.subTest(cfg=cfg), self.assertRaises(ValueError):
+                audit_mcp_config_credentials(cfg)
+
+    def _cli(self, *args):
+        return subprocess.run([sys.executable, '-B', auditor.__file__, *args], capture_output=True)
+
+    def test_cli_duplicate_keys_are_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'm.json'
+            p.write_text('{"mcpServers":{"s":{"command":"x","env":{"API_KEY":"' + self.GHP + '"},"env":{}}}}',
+                         encoding='utf-8')
+            r = self._cli('--audit-mcp-config', str(p))
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertNotIn(self.GHP.encode(), r.stdout + r.stderr)
+            p.write_text('[{"email":"a@p.iam.gserviceaccount.com","roles":["roles/owner"],"roles":[],'
+                         '"createTime":"2026-01-01T00:00:00Z"}]', encoding='utf-8')
+            self.assertEqual(self._cli('--audit-accounts-json', str(p)).returncode, 2)
+
+    def test_roles_with_whitespace_case_and_impersonation_roles(self):
+        for role in (' roles/owner', 'Roles/Owner ', 'roles/iam.serviceAccountTokenCreator',
+                     'roles/iam.serviceAccountUser', 'roles/iam.workloadIdentityUser'):
+            with self.subTest(role=role):
+                accs = [{'email': 'x@p.iam.gserviceaccount.com', 'roles': [role],
+                         'createTime': '2026-01-01T00:00:00Z'}]
+                self.assertFalse(audit_service_account_anomalies(accs)[0])
+
+    def test_burst_check_is_linear_on_large_input(self):
+        accs = [{'email': f'a{i}@p.iam.gserviceaccount.com', 'roles': [],
+                 'createTime': '2026-01-01T00:00:00Z'} for i in range(20000)]
+        start = time.monotonic()
+        safe, found = audit_service_account_anomalies(accs)
+        self.assertLess(time.monotonic() - start, 5.0)
+        self.assertFalse(safe)
+        self.assertIn('20000', found[-1]['reasons'][0])
+
+    def test_scan_dir_follows_directory_links_without_looping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'scan'
+            other = Path(tmp) / 'other'
+            root.mkdir()
+            other.mkdir()
+            (other / '.mainhelper').write_text('x', encoding='utf-8')
+            try:
+                os.symlink(other, root / 'linked', target_is_directory=True)
+                os.symlink(root, other / 'back', target_is_directory=True)
+            except (OSError, NotImplementedError):
+                if sys.platform != 'win32':
+                    self.skipTest('無權限建立符號連結')
+                # Windows 一般帳號不能建符號連結，改用 junction（同樣是目錄連結，也能繞回自己）
+                for link, target in ((root / 'linked', other), (other / 'back', root)):
+                    r = subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(target)], capture_output=True)
+                    if r.returncode != 0:
+                        self.skipTest('無法建立 junction')
+            safe, found = audit_local_persistence_artifacts(str(root))
+            self.assertFalse(safe)
+            self.assertEqual(len(found), 1)
 
 
 if __name__ == "__main__":
